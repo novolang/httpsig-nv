@@ -36,5 +36,8 @@ version = "0.1.0"
 hash = "8fa376b0797a7452b97822010f89a217f10b9e8d5e94f0212e6d0b09efcea315"
 
 [sfv-nv]
-source = "path"
-path = "../sfv-nv"
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "c36be59156d4acb5d5847517977403c62c42e0fa7d00771c922c1eb526978800"

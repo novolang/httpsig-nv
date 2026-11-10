@@ -32,7 +32,7 @@ novo        = ">= 0.23.0"
 # Accept-Signature, and of the component identifiers in the signature base.
 # A path while sfv-nv is not published; the line is recorded in
 # satellites/PATH-DEPENDENCIES.md and becomes `sfv-nv = "^0.1.0"`.
-sfv-nv = { path = "../sfv-nv" }
+sfv-nv = "^0.1.0"
 
 # crypto-nv is HMAC-SHA-256 and SHA-256, and the constant-time comparison of
 # a MAC.
