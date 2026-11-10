@@ -1,0 +1,234 @@
+// hsigfields.nv — the Signature-Input, Signature and Accept-Signature fields.
+//
+// All three are Dictionary Structured Fields (RFC 9421 sections 4.1, 4.2 and
+// 5.1), read and written here through sfv-nv.
+//
+//   Signature-Input   label = Inner List of String Items (the covered
+//                     components, with their parameters) and the signature
+//                     parameters: `sig1=("@method" "date");created=1618884473`
+//   Signature         label = Byte Sequence: `sig1=:P0wLUszW...:`
+//   Accept-Signature  label = Inner List like Signature-Input, whose
+//                     parameters are a request: `created` and `expires` as
+//                     flags with no value, the others with the value wanted.
+//
+// A field may arrive as several lines.  The functions that read one take the
+// lines and join them with a comma and a space before parsing (RFC 9110
+// section 5.3), and the functions that write one answer a `label=value`
+// member, so a caller joins members with `join_members` and sends one field
+// or several.
+//
+// THE ORDER IS KEPT.  Components and parameters come back in the order they
+// were written, because the signature base is built from that order.
+
+use std.bytes
+use std.list
+use std.str
+use hsigtypes
+use sfvchars
+use sfvparse
+use sfvtypes
+use sfvwrite
+
+// One labelled entry of a Signature-Input or Accept-Signature field.
+pub struct HsigInputEntry
+    label: Str
+    components: [HsigComponent]
+    params: [SfvParam]
+
+// One labelled entry of a Signature field.
+pub struct HsigSignatureEntry
+    label: Str
+    signature: Bytes
+
+// The error for a field that does not have the shape RFC 9421 gives it.
+fn bad_field(detail: Str) -> HsigError []
+    hsigtypes.error(HSIG_ERR_BAD_FIELD, detail)
+
+// The covered components of one Inner List: every item must be a String.
+fn components_of(label: Str, inner: SfvInner) -> Result<[HsigComponent], HsigError> []
+    var out: [HsigComponent] = []
+    for it in inner.items
+        match it.value
+            SfvString(name) => list.push(out, HsigComponent { name: name, params: it.params })
+            _               =>
+                return Err(bad_field(label))
+    Ok(out)
+
+// Read the entries of a Signature-Input or an Accept-Signature field, from
+// the field lines.
+//
+// ```novo
+// use std.list
+// use hsigfields
+//
+// fn main() [io]
+//     match hsigfields.parse_signature_input(["sig1=(\"@method\" \"date\");created=1618884473"])
+//         Ok(es) => println("${es[0].label}: ${list.len(es[0].components)} components")   // sig1: 2 components
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_signature_input(lines: [Str]) -> Result<[HsigInputEntry], HsigError> []
+    match sfvparse.parse_dictionary(sfvparse.join_lines(lines))
+        Err(_)      => Err(bad_field("not a Dictionary"))
+        Ok(entries) =>
+            var out: [HsigInputEntry] = []
+            for e in entries
+                match e.member
+                    SfvMemberItem(_)      =>
+                        return Err(bad_field(e.key))
+                    SfvMemberInner(inner) =>
+                        match components_of(e.key, inner)
+                            Err(x)    =>
+                                return Err(x)
+                            Ok(comps) => list.push(out,
+                                HsigInputEntry { label: e.key, components: comps, params: inner.params })
+            Ok(out)
+
+// Read the entries of an Accept-Signature field.  The shape is that of
+// Signature-Input.
+pub fn parse_accept_signature(lines: [Str]) -> Result<[HsigInputEntry], HsigError> []
+    parse_signature_input(lines)
+
+// A copy of a byte string, so that the entry does not share the parsed one.
+fn bytes_copy(b: Bytes) -> Bytes []
+    bytes.clone(b)
+
+// Read the entries of a Signature field, from the field lines.
+//
+// ```novo
+// use std.list
+// use hsigfields
+//
+// fn main() [io]
+//     match hsigfields.parse_signature(["sig1=:aGVsbG8=:"])
+//         Ok(es) => println(es[0].label)   // sig1
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_signature(lines: [Str]) -> Result<[HsigSignatureEntry], HsigError> []
+    match sfvparse.parse_dictionary(sfvparse.join_lines(lines))
+        Err(_)      => Err(bad_field("not a Dictionary"))
+        Ok(entries) =>
+            var out: [HsigSignatureEntry] = []
+            for e in entries
+                match e.member
+                    SfvMemberInner(_) =>
+                        return Err(bad_field(e.key))
+                    SfvMemberItem(it) =>
+                        match it.value
+                            SfvBinary(b) => list.push(out, HsigSignatureEntry { label: e.key, signature: bytes_copy(b) })
+                            _            =>
+                                return Err(bad_field(e.key))
+            Ok(out)
+
+// The entry called `label`, or `None`.
+pub fn find_input(entries: [HsigInputEntry], label: Str) -> ?HsigInputEntry []
+    for e in entries
+        if e.label == label
+            return Some(e)
+    None
+
+// The signature called `label`, or `None`.
+pub fn find_signature(entries: [HsigSignatureEntry], label: Str) -> ?HsigSignatureEntry []
+    for e in entries
+        if e.label == label
+            return Some(e)
+    None
+
+// The member of a Signature-Input or Accept-Signature field for one
+// signature: `label=(...)` and the parameters.
+//
+// ```novo
+// use hsigfields
+// use hsigtypes
+// use sfvtypes
+//
+// fn main() [io]
+//     let comps = [hsigtypes.component("@method"), hsigtypes.component("date")]
+//     match hsigfields.input_member("sig1", comps, [sfvtypes.param("created", SfvInteger(1618884473))])
+//         Ok(m) => println(m)   // sig1=("@method" "date");created=1618884473
+//         Err(e) => println(e.message())
+// ```
+pub fn input_member(label: Str, components: [HsigComponent],
+                    params: [SfvParam]) -> Result<Str, HsigError> []
+    if not sfvchars.valid_key(label)
+        return Err(bad_field(label))
+    var items: [SfvItem] = []
+    for c in components
+        list.push(items, hsigtypes.component_item(c))
+    let entry = SfvEntry { key: label, member: SfvMemberInner(sfvtypes.inner(items, params)) }
+    match sfvwrite.serialize_dictionary([entry])
+        Ok(t)  => Ok(t)
+        Err(_) => Err(hsigtypes.error(HSIG_ERR_UNSERIALISABLE, label))
+
+// The member of a Signature field for one signature: `label=:base64:`.
+pub fn signature_member(label: Str, signature: Bytes) -> Result<Str, HsigError> []
+    if not sfvchars.valid_key(label)
+        return Err(bad_field(label))
+    Ok(label + "=:" + bytes.to_base64(signature) + ":")
+
+// Members joined into one field value, with a comma and a space.
+pub fn join_members(members: [Str]) -> Str []
+    str.join(members, ", ")
+
+// The Integer parameter `created` of a signature, or `None`.
+pub fn created(params: [SfvParam]) -> ?Int []
+    match sfvtypes.param_get(params, "created")
+        Some(v) => sfvtypes.as_int(v)
+        None    => None
+
+// The Integer parameter `expires` of a signature, or `None`.
+pub fn expires(params: [SfvParam]) -> ?Int []
+    match sfvtypes.param_get(params, "expires")
+        Some(v) => sfvtypes.as_int(v)
+        None    => None
+
+// The String parameter `nonce` of a signature, or `None`.
+pub fn nonce(params: [SfvParam]) -> ?Str []
+    match sfvtypes.param_get(params, "nonce")
+        Some(v) => sfvtypes.as_string(v)
+        None    => None
+
+// The String parameter `alg` of a signature, or `None`.
+pub fn alg(params: [SfvParam]) -> ?Str []
+    match sfvtypes.param_get(params, "alg")
+        Some(v) => sfvtypes.as_string(v)
+        None    => None
+
+// The String parameter `keyid` of a signature, or `None`.
+pub fn keyid(params: [SfvParam]) -> ?Str []
+    match sfvtypes.param_get(params, "keyid")
+        Some(v) => sfvtypes.as_string(v)
+        None    => None
+
+// The String parameter `tag` of a signature, or `None`.
+pub fn tag(params: [SfvParam]) -> ?Str []
+    match sfvtypes.param_get(params, "tag")
+        Some(v) => sfvtypes.as_string(v)
+        None    => None
+
+// The signature parameters that answer a request in an Accept-Signature
+// entry (RFC 9421 section 5.2): the entry's parameters in its order, with
+// `created` and `expires` given the values passed here and the others copied.
+//
+// `expires` is the time to write for a requested `expires`.  When the entry
+// does not ask for one it is ignored.
+//
+// ```novo
+// use hsigfields
+//
+// fn main() [io]
+//     match hsigfields.parse_accept_signature(["sig1=(\"@method\");keyid=\"k\";created;tag=\"t\""])
+//         Ok(es) =>
+//             let ps = hsigfields.fulfil_params(es[0], 1618884473, 1618884773)
+//             println("${hsigfields.created(ps) ?? 0}")   // 1618884473
+//         Err(_) => println("bad")
+// ```
+pub fn fulfil_params(entry: HsigInputEntry, created_at: Int, expires_at: Int) -> [SfvParam] []
+    var out: [SfvParam] = []
+    for p in entry.params
+        if p.key == "created"
+            list.push(out, sfvtypes.param("created", SfvInteger(created_at)))
+        else if p.key == "expires"
+            list.push(out, sfvtypes.param("expires", SfvInteger(expires_at)))
+        else
+            list.push(out, p)
+    out

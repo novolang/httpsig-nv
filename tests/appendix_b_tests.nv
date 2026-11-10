@@ -1,0 +1,794 @@
+// appendix_b_tests.nv — the test vectors of RFC 9421.
+//
+// The data below is copied from the RFC as it is printed, with the line
+// wrapping of RFC 8792 undone: the example keys of Appendix B.1, the
+// test-request and test-response messages of B.2, the signature bases, the
+// Signature-Input and Signature fields of B.2.1 to B.2.6, the TLS-terminating
+// proxy of B.3, the transformations of B.4, and the two signatures of
+// section 4.3 (a client's ECDSA and a proxy's RSASSA-PKCS1-v1_5).
+//
+// What each vector proves:
+//
+//   B.2.1, B.2.2, B.2.3   rsa-pss-sha512.  The signature base and the
+//                         Signature-Input field are rebuilt and compared byte
+//                         for byte.  The signature is NOT CHECKED: rsa-nv has
+//                         no SHA-512, so this package does not implement
+//                         `rsa-pss-sha512`.
+//   B.2.4                 ecdsa-p256-sha256 on a response: the RFC's signature
+//                         is verified; a signature made here is verified.
+//   B.2.5                 hmac-sha256: the signature made here equals the
+//                         RFC's bytes.
+//   B.2.6                 ed25519: the signature made here equals the RFC's
+//                         bytes.
+//   B.3                   ecdsa-p256-sha256 over a Client-Cert field value.
+//   B.4                   ed25519 through the allowed transformations of a
+//                         message, and the two changes that must break it.
+//   Section 4.3           a Signature-Input and a Signature field with two
+//                         labels: the client's ecdsa-p256-sha256 and the
+//                         proxy's rsa-v1_5-sha256.
+//
+// ECDSA is non-deterministic in the RFC's figures, so a signature made by this
+// package is checked by verifying it, not by comparing it.
+
+use std.bytes
+use std.list
+use std.str
+use std.test
+use hsigalg
+use hsigbase
+use hsigfields
+use hsigmsg
+use hsigtypes
+use httpsig
+use sfvtypes
+
+// ── The data of RFC 9421, as printed ────────────────────────────────
+
+fn request_msg() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: example.com",
+        "Date: Tue, 20 Apr 2021 02:07:55 GMT",
+        "Content-Type: application/json",
+        "Content-Digest: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "Content-Length: 18"]
+
+fn response_msg() -> [Str]
+    [
+        "HTTP/1.1 200 OK",
+        "Date: Tue, 20 Apr 2021 02:07:56 GMT",
+        "Content-Type: application/json",
+        "Content-Digest: sha-512=:mEWXIS7MaLRuGgxOBdODa3xqM1XdEvxoYhvlCFJ41QJgJc4GTsPp29l5oGX69wWdXymyU0rjJuahq4l5aGgfLQ==:",
+        "Content-Length: 23"]
+
+fn b21_base() -> [Str]
+    [
+        "\"@signature-params\": ();created=1618884473;keyid=\"test-key-rsa-pss\";nonce=\"b3k2pp5k7z-50gnwp.yemd\""]
+
+fn b21_hdr() -> [Str]
+    [
+        "(the fields, as printed)",
+        "Signature-Input: sig-b21=();created=1618884473;keyid=\"test-key-rsa-pss\";nonce=\"b3k2pp5k7z-50gnwp.yemd\"",
+        "Signature: sig-b21=:d2pmTvmbncD3xQm8E9ZV2828BjQWGgiwAaw5bAkgibUopemLJcWDy/lkbbHAve4cRAtx31Iq786U7it++wgGxbtRxf8Udx7zFZsckzXaJMkA7ChG52eSkFxykJeNqsrWH5S+oxNFlD4dzVuwe8DhTSja8xxbR/Z2cOGdCbzR72rgFWhzx2VjBqJzsPLMIQKhO4DGezXehhWwE56YCE+O6c0mKZsfxVrogUvA4HELjVKWmAvtl6UnCh8jYzuVG5WSb/QEVPnP5TmcAnLH1g+s++v6d4s8m0gCw1fV5/SITLq9mhho8K3+7EPYTU8IU1bLhdxO5Nyt8C8ssinQ98Xw9Q==:"]
+
+fn b22_base() -> [Str]
+    [
+        "\"@authority\": example.com",
+        "\"content-digest\": sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "\"@query-param\";name=\"Pet\": dog",
+        "\"@signature-params\": (\"@authority\" \"content-digest\" \"@query-param\";name=\"Pet\");created=1618884473;keyid=\"test-key-rsa-pss\";tag=\"header-example\""]
+
+fn b22_hdr() -> [Str]
+    [
+        "(the fields, as printed)",
+        "Signature-Input: sig-b22=(\"@authority\" \"content-digest\" \"@query-param\";name=\"Pet\");created=1618884473;keyid=\"test-key-rsa-pss\";tag=\"header-example\"",
+        "Signature: sig-b22=:LjbtqUbfmvjj5C5kr1Ugj4PmLYvx9wVjZvD9GsTT4F7GrcQEdJzgI9qHxICagShLRiLMlAJjtq6N4CDfKtjvuJyE5qH7KT8UCMkSowOB4+ECxCmT8rtAmj/0PIXxi0A0nxKyB09RNrCQibbUjsLS/2YyFYXEu4TRJQzRw1rLEuEfY17SARYhpTlaqwZVtR8NV7+4UKkjqpcAoFqWFQh62s7Cl+H2fjBSpqfZUJcsIk4N6wiKYd4je2U/lankenQ99PZfB4jY3I5rSV2DSBVkSFsURIjYErOs0tFTQosMTAoxk//0RoKUqiYY8Bh0aaUEb0rQl3/XaVe4bXTugEjHSw==:"]
+
+fn b23_base() -> [Str]
+    [
+        "\"date\": Tue, 20 Apr 2021 02:07:55 GMT",
+        "\"@method\": POST",
+        "\"@path\": /foo",
+        "\"@query\": ?param=Value&Pet=dog",
+        "\"@authority\": example.com",
+        "\"content-type\": application/json",
+        "\"content-digest\": sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "\"content-length\": 18",
+        "\"@signature-params\": (\"date\" \"@method\" \"@path\" \"@query\" \"@authority\" \"content-type\" \"content-digest\" \"content-length\");created=1618884473;keyid=\"test-key-rsa-pss\""]
+
+fn b23_hdr() -> [Str]
+    [
+        "(the fields, as printed)",
+        "Signature-Input: sig-b23=(\"date\" \"@method\" \"@path\" \"@query\" \"@authority\" \"content-type\" \"content-digest\" \"content-length\");created=1618884473;keyid=\"test-key-rsa-pss\"",
+        "Signature: sig-b23=:bbN8oArOxYoyylQQUU6QYwrTuaxLwjAC9fbY2F6SVWvh0yBiMIRGOnMYwZ/5MR6fb0Kh1rIRASVxFkeGt683+qRpRRU5p2voTp768ZrCUb38K0fUxN0O0iC59DzYx8DFll5GmydPxSmme9v6ULbMFkl+V5B1TP/yPViV7KsLNmvKiLJH1pFkh/aYA2HXXZzNBXmIkoQoLd7YfW91kE9o/CCoC1xMy7JA1ipwvKvfrs65ldmlu9bpG6A9BmzhuzF8Eim5f8ui9eH8LZH896+QIF61ka39VBrohr9iyMUJpvRX2Zbhl5ZJzSRxpJyoEZAFL2FUo5fTIztsDZKEgM4cUA==:"]
+
+fn b24_base() -> [Str]
+    [
+        "\"@status\": 200",
+        "\"content-type\": application/json",
+        "\"content-digest\": sha-512=:mEWXIS7MaLRuGgxOBdODa3xqM1XdEvxoYhvlCFJ41QJgJc4GTsPp29l5oGX69wWdXymyU0rjJuahq4l5aGgfLQ==:",
+        "\"content-length\": 23",
+        "\"@signature-params\": (\"@status\" \"content-type\" \"content-digest\" \"content-length\");created=1618884473;keyid=\"test-key-ecc-p256\""]
+
+fn b24_hdr() -> [Str]
+    [
+        "(the fields, as printed)",
+        "Signature-Input: sig-b24=(\"@status\" \"content-type\" \"content-digest\" \"content-length\");created=1618884473;keyid=\"test-key-ecc-p256\"",
+        "Signature: sig-b24=:wNmSUAhwb5LxtOtOpNa6W5xj067m5hFrj0XQ4fvpaCLx0NKocgPquLgyahnzDnDAUy5eCdlYUEkLIj+32oiasw==:"]
+
+fn b25_base() -> [Str]
+    [
+        "\"date\": Tue, 20 Apr 2021 02:07:55 GMT",
+        "\"@authority\": example.com",
+        "\"content-type\": application/json",
+        "\"@signature-params\": (\"date\" \"@authority\" \"content-type\");created=1618884473;keyid=\"test-shared-secret\""]
+
+fn b25_hdr() -> [Str]
+    [
+        "(the fields, as printed)",
+        "Signature-Input: sig-b25=(\"date\" \"@authority\" \"content-type\");created=1618884473;keyid=\"test-shared-secret\"",
+        "Signature: sig-b25=:pxcQw6G3AjtMBQjwo8XzkZf/bws5LelbaMk5rGIGtE8=:"]
+
+fn b26_base() -> [Str]
+    [
+        "\"date\": Tue, 20 Apr 2021 02:07:55 GMT",
+        "\"@method\": POST",
+        "\"@path\": /foo",
+        "\"@authority\": example.com",
+        "\"content-type\": application/json",
+        "\"content-length\": 18",
+        "\"@signature-params\": (\"date\" \"@method\" \"@path\" \"@authority\" \"content-type\" \"content-length\");created=1618884473;keyid=\"test-key-ed25519\""]
+
+fn b26_hdr() -> [Str]
+    [
+        "(the fields, as printed)",
+        "Signature-Input: sig-b26=(\"date\" \"@method\" \"@path\" \"@authority\" \"content-type\" \"content-length\");created=1618884473;keyid=\"test-key-ed25519\"",
+        "Signature: sig-b26=:wqcAqbmYJ2ji2glfAMaRy4gruYYnx2nEFN2HN6jrnDnQCK1u02Gb04v9EDgwUPiu4A0w6vuQv5lIp5WPpBKRCw==:"]
+
+fn b3_unsigned() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: service.internal.example",
+        "Date: Tue, 20 Apr 2021 02:07:55 GMT",
+        "Content-Type: application/json",
+        "Content-Length: 18",
+        "Client-Cert: :MIIBqDCCAU6gAwIBAgIBBzAKBggqhkjOPQQDAjA6MRswGQYDVQQKDBJMZXQncyBBdXRoZW50aWNhdGUxGzAZBgNVBAMMEkxBIEludGVybWVkaWF0ZSBDQTAeFw0yMDAxMTQyMjU1MzNaFw0yMTAxMjMyMjU1MzNaMA0xCzAJBgNVBAMMAkJDMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8YnXXfaUgmnMtOXU/IncWalRhebrXmckC8vdgJ1p5Be5F/3YC8OthxM4+k1M6aEAEFcGzkJiNy6J84y7uzo9M6NyMHAwCQYDVR0TBAIwADAfBgNVHSMEGDAWgBRm3WjLa38lbEYCuiCPct0ZaSED2DAOBgNVHQ8BAf8EBAMCBsAwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0RAQH/BBMwEYEPYmRjQGV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0gAMEUCIBHda/r1vaL6G3VliL4/Di6YK0Q6bMjeSkC3dFCOOB8TAiEAx/kHSB4urmiZ0NX5r5XarmPk0wmuydBVoU4hBVZ1yhk=:"]
+
+fn b3_base() -> [Str]
+    [
+        "\"@path\": /foo",
+        "\"@query\": ?param=Value&Pet=dog",
+        "\"@method\": POST",
+        "\"@authority\": service.internal.example",
+        "\"client-cert\": :MIIBqDCCAU6gAwIBAgIBBzAKBggqhkjOPQQDAjA6MRswGQYDVQQKDBJMZXQncyBBdXRoZW50aWNhdGUxGzAZBgNVBAMMEkxBIEludGVybWVkaWF0ZSBDQTAeFw0yMDAxMTQyMjU1MzNaFw0yMTAxMjMyMjU1MzNaMA0xCzAJBgNVBAMMAkJDMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8YnXXfaUgmnMtOXU/IncWalRhebrXmckC8vdgJ1p5Be5F/3YC8OthxM4+k1M6aEAEFcGzkJiNy6J84y7uzo9M6NyMHAwCQYDVR0TBAIwADAfBgNVHSMEGDAWgBRm3WjLa38lbEYCuiCPct0ZaSED2DAOBgNVHQ8BAf8EBAMCBsAwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0RAQH/BBMwEYEPYmRjQGV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0gAMEUCIBHda/r1vaL6G3VliL4/Di6YK0Q6bMjeSkC3dFCOOB8TAiEAx/kHSB4urmiZ0NX5r5XarmPk0wmuydBVoU4hBVZ1yhk=:",
+        "\"@signature-params\": (\"@path\" \"@query\" \"@method\" \"@authority\" \"client-cert\");created=1618884473;keyid=\"test-key-ecc-p256\""]
+
+fn b3_sig() -> [Str]
+    [
+        "xVMHVpawaAC/0SbHrKRs9i8I3eOs5RtTMGCWXm/9nvZzoHsIg6Mce9315T6xoklyy0yzhD9ah4JHRwMLOgmizw=="]
+
+fn b3_signed() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: service.internal.example",
+        "Date: Tue, 20 Apr 2021 02:07:55 GMT",
+        "Content-Type: application/json",
+        "Content-Length: 18",
+        "Client-Cert: :MIIBqDCCAU6gAwIBAgIBBzAKBggqhkjOPQQDAjA6MRswGQYDVQQKDBJMZXQncyBBdXRoZW50aWNhdGUxGzAZBgNVBAMMEkxBIEludGVybWVkaWF0ZSBDQTAeFw0yMDAxMTQyMjU1MzNaFw0yMTAxMjMyMjU1MzNaMA0xCzAJBgNVBAMMAkJDMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8YnXXfaUgmnMtOXU/IncWalRhebrXmckC8vdgJ1p5Be5F/3YC8OthxM4+k1M6aEAEFcGzkJiNy6J84y7uzo9M6NyMHAwCQYDVR0TBAIwADAfBgNVHSMEGDAWgBRm3WjLa38lbEYCuiCPct0ZaSED2DAOBgNVHQ8BAf8EBAMCBsAwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0RAQH/BBMwEYEPYmRjQGV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0gAMEUCIBHda/r1vaL6G3VliL4/Di6YK0Q6bMjeSkC3dFCOOB8TAiEAx/kHSB4urmiZ0NX5r5XarmPk0wmuydBVoU4hBVZ1yhk=:",
+        "Signature-Input: ttrp=(\"@path\" \"@query\" \"@method\" \"@authority\" \"client-cert\");created=1618884473;keyid=\"test-key-ecc-p256\"",
+        "Signature: ttrp=:xVMHVpawaAC/0SbHrKRs9i8I3eOs5RtTMGCWXm/9nvZzoHsIg6Mce9315T6xoklyy0yzhD9ah4JHRwMLOgmizw==:"]
+
+fn b4_msg() -> [Str]
+    [
+        "GET /demo?name1=Value1&Name2=value2 HTTP/1.1",
+        "Host: example.org",
+        "Date: Fri, 15 Jul 2022 14:24:55 GMT",
+        "Accept: application/json",
+        "Accept: */*",
+        "Signature-Input: transform=(\"@method\" \"@path\" \"@authority\" \"accept\");created=1618884473;keyid=\"test-key-ed25519\"",
+        "Signature: transform=:ZT1kooQsEHpZ0I1IjCqtQppOmIqlJPeo7DHR3SoMn0s5JZ1eRGS0A+vyYP9t/LXlh5QMFFQ6cpLt2m0pmj3NDA==:"]
+
+fn b4_base() -> [Str]
+    [
+        "\"@method\": GET",
+        "\"@path\": /demo",
+        "\"@authority\": example.org",
+        "\"accept\": application/json, */*",
+        "\"@signature-params\": (\"@method\" \"@path\" \"@authority\" \"accept\");created=1618884473;keyid=\"test-key-ed25519\""]
+
+fn m43_client() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: example.com",
+        "Date: Tue, 20 Apr 2021 02:07:55 GMT",
+        "Content-Type: application/json",
+        "Content-Length: 18",
+        "Content-Digest: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "Signature-Input: sig1=(\"@method\" \"@authority\" \"@path\" \"content-digest\" \"content-type\" \"content-length\");created=1618884475;keyid=\"test-key-ecc-p256\"",
+        "Signature: sig1=:X5spyd6CFnAG5QnDyHfqoSNICd+BUP4LYMz2Q0JXlb//4Ijpzp+kve2w4NIyqeAuM7jTDX+sNalzA8ESSaHD3A==:"]
+
+fn m43_proxy_base() -> [Str]
+    [
+        "\"@method\": POST",
+        "\"@authority\": origin.host.internal.example",
+        "\"@path\": /foo",
+        "\"content-digest\": sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "\"content-type\": application/json",
+        "\"content-length\": 18",
+        "\"forwarded\": for=192.0.2.123;host=example.com;proto=https",
+        "\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\" \"content-type\" \"content-length\" \"forwarded\");created=1618884480;keyid=\"test-key-rsa\";alg=\"rsa-v1_5-sha256\";expires=1618884540"]
+
+fn m43_proxy_sig() -> [Str]
+    [
+        "S6ZzPXSdAMOPjN/6KXfXWNO/f7V6cHm7BXYUh3YD/fRad4BCaRZxP+JH+8XY1I6+8Cy+CM5g92iHgxtRPz+MjniOaYmdkDcnL9cCpXJleXsOckpURl49GwiyUpZ10KHgOEe11sx3G2gxI8S0jnxQB+Pu68U9vVcasqOWAEObtNKKZd8tSFu7LB5YAv0RAGhB8tmpv7sFnIm9y+7X5kXQfi8NMaZaA8i2ZHwpBdg7a6CMfwnnrtflzvZdXAsD3LH2TwevU+/PBPv0B6NMNk93wUs/vfJvye+YuI87HU38lZHowtznbLVdp770I6VHR6WfgS9ddzirrswsE1w5o0LV/g=="]
+
+fn m43_forwarded() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: origin.host.internal.example",
+        "Date: Tue, 20 Apr 2021 02:07:56 GMT",
+        "Content-Type: application/json",
+        "Content-Length: 18",
+        "Forwarded: for=192.0.2.123;host=example.com;proto=https",
+        "Content-Digest: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "Signature-Input: sig1=(\"@method\" \"@authority\" \"@path\" \"content-digest\" \"content-type\" \"content-length\");created=1618884475;keyid=\"test-key-ecc-p256\", proxy_sig=(\"@method\" \"@authority\" \"@path\" \"content-digest\" \"content-type\" \"content-length\" \"forwarded\");created=1618884480;keyid=\"test-key-rsa\";alg=\"rsa-v1_5-sha256\";expires=1618884540",
+        "Signature: sig1=:X5spyd6CFnAG5QnDyHfqoSNICd+BUP4LYMz2Q0JXlb//4Ijpzp+kve2w4NIyqeAuM7jTDX+sNalzA8ESSaHD3A==:, proxy_sig=:S6ZzPXSdAMOPjN/6KXfXWNO/f7V6cHm7BXYUh3YD/fRad4BCaRZxP+JH+8XY1I6+8Cy+CM5g92iHgxtRPz+MjniOaYmdkDcnL9cCpXJleXsOckpURl49GwiyUpZ10KHgOEe11sx3G2gxI8S0jnxQB+Pu68U9vVcasqOWAEObtNKKZd8tSFu7LB5YAv0RAGhB8tmpv7sFnIm9y+7X5kXQfi8NMaZaA8i2ZHwpBdg7a6CMfwnnrtflzvZdXAsD3LH2TwevU+/PBPv0B6NMNk93wUs/vfJvye+YuI87HU38lZHowtznbLVdp770I6VHR6WfgS9ddzirrswsE1w5o0LV/g==:"]
+
+fn r24_request() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: example.com",
+        "Date: Tue, 20 Apr 2021 02:07:55 GMT",
+        "Content-Digest: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "Content-Type: application/json",
+        "Content-Length: 18"]
+
+fn r24_base() -> [Str]
+    [
+        "\"@status\": 503",
+        "\"content-digest\": sha-512=:0Y6iCBzGg5rZtoXS95Ijz03mslf6KAMCloESHObfwnHJDbkkWWQz6PhhU9kxsTbARtY2PTBOzq24uJFpHsMuAg==:",
+        "\"content-type\": application/json",
+        "\"@authority\";req: example.com",
+        "\"@method\";req: POST",
+        "\"@path\";req: /foo",
+        "\"content-digest\";req: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "\"@signature-params\": (\"@status\" \"content-digest\" \"content-type\" \"@authority\";req \"@method\";req \"@path\";req \"content-digest\";req);created=1618884479;keyid=\"test-key-ecc-p256\""]
+
+fn r24_signed() -> [Str]
+    [
+        "HTTP/1.1 503 Service Unavailable",
+        "Date: Tue, 20 Apr 2021 02:07:56 GMT",
+        "Content-Type: application/json",
+        "Content-Length: 62",
+        "Content-Digest: sha-512=:0Y6iCBzGg5rZtoXS95Ijz03mslf6KAMCloESHObfwnHJDbkkWWQz6PhhU9kxsTbARtY2PTBOzq24uJFpHsMuAg==:",
+        "Signature-Input: reqres=(\"@status\" \"content-digest\" \"content-type\" \"@authority\";req \"@method\";req \"@path\";req \"content-digest\";req);created=1618884479;keyid=\"test-key-ecc-p256\"",
+        "Signature: reqres=:dMT/A/76ehrdBTD/2Xx8QuKV6FoyzEP/I9hdzKN8LQJLNgzU4W767HK05rx1i8meNQQgQPgQp8wq2ive3tV5Ag==:"]
+
+fn r24_signed_request() -> [Str]
+    [
+        "POST /foo?param=Value&Pet=dog HTTP/1.1",
+        "Host: example.com",
+        "Date: Tue, 20 Apr 2021 02:07:55 GMT",
+        "Content-Digest: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "Content-Type: application/json",
+        "Content-Length: 18",
+        "Signature-Input: sig1=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\" \"content-type\" \"content-length\");created=1618884475;keyid=\"test-key-rsa-pss\"",
+        "Signature: sig1=:e8UJ5wMiRaonlth5ERtE8GIiEH7Akcr493nQ07VPNo6y3qvjdKt0fo8VHO8xXDjmtYoatGYBGJVlMfIp06eVMEyNW2I4vN7XDAz7m5v1108vGzaDljrd0H8+SJ28g7bzn6h2xeL/8q+qUwahWA/JmC8aOC9iVnwbOKCc0WSrLgWQwTY6VLp42Qt7jjhYT5W7/wCvfK9A1VmHH1lJXsV873Z6hpxesd50PSmO+xaNeYvDLvVdZlhtw5PCtUYzKjHqwmaQ6DEuM8udRjYsoNqp2xZKcuCO1nKc0V3RjpqMZLuuyVbHDAbCzr0pg2d2VM/OC33JAU7meEjjaNz+d7LWPg==:"]
+
+fn r24_base2() -> [Str]
+    [
+        "\"@status\": 503",
+        "\"content-digest\": sha-512=:0Y6iCBzGg5rZtoXS95Ijz03mslf6KAMCloESHObfwnHJDbkkWWQz6PhhU9kxsTbARtY2PTBOzq24uJFpHsMuAg==:",
+        "\"content-type\": application/json",
+        "\"@authority\";req: example.com",
+        "\"@method\";req: POST",
+        "\"@path\";req: /foo",
+        "\"@query\";req: ?param=Value&Pet=dog",
+        "\"content-digest\";req: sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "\"content-type\";req: application/json",
+        "\"content-length\";req: 18",
+        "\"@signature-params\": (\"@status\" \"content-digest\" \"content-type\" \"@authority\";req \"@method\";req \"@path\";req \"@query\";req \"content-digest\";req \"content-type\";req \"content-length\";req);created=1618884479;keyid=\"test-key-ecc-p256\""]
+
+fn r24_signed2() -> [Str]
+    [
+        "HTTP/1.1 503 Service Unavailable",
+        "Date: Tue, 20 Apr 2021 02:07:56 GMT",
+        "Content-Type: application/json",
+        "Content-Length: 62",
+        "Content-Digest: sha-512=:0Y6iCBzGg5rZtoXS95Ijz03mslf6KAMCloESHObfwnHJDbkkWWQz6PhhU9kxsTbARtY2PTBOzq24uJFpHsMuAg==:",
+        "Signature-Input: reqres=(\"@status\" \"content-digest\" \"content-type\" \"@authority\";req \"@method\";req \"@path\";req \"@query\";req \"content-digest\";req \"content-type\";req \"content-length\";req);created=1618884479;keyid=\"test-key-ecc-p256\"",
+        "Signature: reqres=:C73J41GVKc+TYXbSobvZf0CmNcptRiWN+NY1Or0A36ISg6ymdRN6ZgR2QfrtopFNzqAyv+CeWrMsNbcV2Ojsgg==:"]
+
+fn rsa_n_b64u() -> Str
+    "hAKYdtoeoy8zcAcR874L8cnZxKzAGwd7v36APp7Pv6Q2jdsPBRrwWEBnez6d0UDKDwGbc6nxfEXAy5mbhgajzrw3MOEt8uA5txSKobBpKDeBLOsdJKFqMGmXCQvEG7YemcxDTRPxAleIAgYYRjTSd_QBwVW9OwNFhekro3RtlinV0a75jfZgkne_YiktSvLG34lw2zqXBDTC5NHROUqGTlML4PlNZS5Ri2U4aCNx2rUPRcKIlE0PuKxI4T-HIaFpv8-rdV6eUgOrB2xeI1dSFFn_nnv5OoZJEIB-VmuKn3DCUcCZSFlQPSXSfBDiUGhwOw76WuSSsf1D4b_vLoJ10w"
+
+fn rsa_e_b64u() -> Str
+    "AQAB"
+
+fn p256_d_b64u() -> Str
+    "UpuF81l-kOxbjf7T4mNSv0r5tN67Gim7rnf6EFpcYDs"
+
+fn p256_x_b64u() -> Str
+    "qIVYZVLCrPZHGHjP17CTW0_-D9Lfw0EkjqF7xB4FivA"
+
+fn p256_y_b64u() -> Str
+    "Mc4nN9LTDOBhfoUeg8Ye9WedFRhnZXZJA12Qp0zZ6F0"
+
+fn ed_seed_b64u() -> Str
+    "n4Ni-HpISpVObnQMW0wOhCKROaIKqKtW_2ZYb2p9KcU"
+
+fn ed_pub_b64u() -> Str
+    "JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs"
+
+fn shared_secret_b64() -> Str
+    "uzvJfB4u3N0Jy4T7NZ75MDVcr8zSTInedJtkgcu46YW4XByzNJjxBdtjUkdJPBtbmHhIDi6pcl8jsasjlTMtDQ=="
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+fn joined(ls: [Str]) -> Str
+    str.join(ls, "\n")
+
+// The header fields of a message printed as an RFC does: the start line,
+// then `Name: value` lines.
+fn headers_of(lines: [Str]) -> [HsigField]
+    var out: [HsigField] = []
+    for i in 1..list.len(lines)
+        let l = lines[i]
+        match str.index(l, ": ")
+            Some(k) => list.push(out, hsigtypes.field(str.slice(l, 0, k), str.slice(l, k + 2, str.len(l))))
+            None    => ()
+    out
+
+// The value of the first field with a name, in lower case.
+fn header_value(lines: [Str], name: Str) -> Str
+    for f in headers_of(lines)
+        if str.lower(f.name) == name
+            return f.value
+    ""
+
+// The values of every field with a name.
+fn header_values(lines: [Str], name: Str) -> [Str]
+    hsigmsg.field_lines(headers_of(lines), name)
+
+// A request from its printed form: the method and target are on the first
+// line and the authority is the Host field.
+fn request_of(lines: [Str]) -> HsigMessage
+    let parts = str.split(lines[0], " ")
+    match hsigmsg.request(parts[0], "https://" + header_value(lines, "host") + parts[1], headers_of(lines))
+        Ok(m)  => m
+        Err(_) => hsigtypes.response(0, [])
+
+// A response from its printed form.
+fn response_of(lines: [Str]) -> HsigMessage
+    let parts = str.split(lines[0], " ")
+    hsigtypes.response(str.to_int(parts[1]) ?? 0, headers_of(lines))
+
+// Bytes from base64 text in the URL alphabet, without padding.
+fn from_b64url(s: Str) -> Bytes
+    var t = str.replace_all(str.replace_all(s, "-", "+"), "_", "/")
+    while str.len(t) % 4 != 0
+        t = t + "="
+    bytes.from_base64(t) ?? bytes.zeros(0)
+
+// Bytes from standard base64 text.
+fn from_b64(s: Str) -> Bytes
+    bytes.from_base64(s) ?? bytes.zeros(0)
+
+// The signature bytes of one label in the `Signature` field of a message.
+fn signature_bytes(lines: [Str], label: Str) -> Bytes
+    match hsigfields.parse_signature(header_values(lines, "signature"))
+        Err(_) => bytes.zeros(0)
+        Ok(es) =>
+            match hsigfields.find_signature(es, label)
+                None    => bytes.zeros(0)
+                Some(e) => bytes.clone(e.signature)
+
+// The error code of a failed verification, or 0 when it succeeded.
+fn verify_code(msg: HsigMessage, lines: [Str], label: Str, key: HsigVerifyKey) -> Int
+    match httpsig.verify(msg,
+        None,
+        header_values(lines, "signature-input"),
+        header_values(lines, "signature"),
+        label,
+        key)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+fn secret_key() -> Bytes
+    from_b64(shared_secret_b64())
+
+fn ed_signing() -> HsigKey
+    HsigEd25519Key(from_b64url(ed_seed_b64u()))
+
+fn ed_verifying() -> HsigVerifyKey
+    HsigEd25519VerifyKey(from_b64url(ed_pub_b64u()))
+
+fn ecc_signing() -> HsigKey
+    HsigEcdsaP256Key(from_b64url(p256_d_b64u()))
+
+fn ecc_verifying() -> HsigVerifyKey
+    HsigEcdsaP256VerifyKey(from_b64url(p256_x_b64u()), from_b64url(p256_y_b64u()))
+
+fn rsa_verifying() -> HsigVerifyKey
+    HsigRsaV15VerifyKey(from_b64url(rsa_n_b64u()), from_b64url(rsa_e_b64u()))
+
+// The covered components of a vector as the RFC lists them, from the
+// Signature-Input line printed in the RFC.
+fn input_entry(hdr: [Str], label: Str) -> HsigInputEntry
+    match hsigfields.parse_signature_input([header_value(hdr, "signature-input")])
+        Err(_) => HsigInputEntry { label: "", components: [], params: [] }
+        Ok(es) =>
+            match hsigfields.find_input(es, label)
+                None    => HsigInputEntry { label: "", components: [], params: [] }
+                Some(e) => e
+
+fn str_param(key: Str, v: Str) -> SfvParam
+    sfvtypes.param(key, SfvString(v))
+
+fn int_param(key: Str, v: Int) -> SfvParam
+    sfvtypes.param(key, SfvInteger(v))
+
+// ── B.2.1, B.2.2, B.2.3: rsa-pss-sha512 ──────────────────────────────
+
+@test
+fn test_b21_minimal_signature_covers_nothing_but_its_parameters()
+    let msg = request_of(request_msg())
+    let params = [int_param("created", 1618884473),
+        str_param("keyid", "test-key-rsa-pss"),
+        str_param("nonce", "b3k2pp5k7z-50gnwp.yemd")]
+
+    test.case("the signature base is the parameters line alone")
+    test.assert(hsigbase.signature_base(msg, None, [], params) == Ok(joined(b21_base())))
+
+    test.case("the Signature-Input member is the RFC's")
+    test.assert(hsigfields.input_member("sig-b21", [], params) == Ok(header_value(b21_hdr(), "signature-input")))
+
+    test.case("the RFC's Signature-Input field reads back to the same components and parameters")
+    let e = input_entry(b21_hdr(), "sig-b21")
+    test.assert(list.len(e.components) == 0)
+    test.assert(hsigbase.signature_base(msg, None, e.components, e.params) == Ok(joined(b21_base())))
+
+@test
+fn test_b22_selective_components_with_a_query_parameter()
+    let msg = request_of(request_msg())
+    let comps = [hsigtypes.component("@authority"),
+        hsigtypes.component("content-digest"),
+        hsigtypes.component_query_param("Pet")]
+    let params = [int_param("created", 1618884473),
+        str_param("keyid", "test-key-rsa-pss"),
+        str_param("tag", "header-example")]
+
+    test.case("the signature base")
+    test.assert(hsigbase.signature_base(msg, None, comps, params) == Ok(joined(b22_base())))
+
+    test.case("the Signature-Input member")
+    test.assert(hsigfields.input_member("sig-b22", comps, params) == Ok(header_value(b22_hdr(), "signature-input")))
+
+    test.case("read back from the RFC's field")
+    let e = input_entry(b22_hdr(), "sig-b22")
+    test.assert(list.len(e.components) == 3)
+    test.assert(hsigbase.signature_base(msg, None, e.components, e.params) == Ok(joined(b22_base())))
+
+@test
+fn test_b23_full_coverage_of_the_request()
+    let msg = request_of(request_msg())
+    let comps = [hsigtypes.component("date"),
+        hsigtypes.component("@method"),
+        hsigtypes.component("@path"),
+        hsigtypes.component("@query"),
+        hsigtypes.component("@authority"),
+        hsigtypes.component("content-type"),
+        hsigtypes.component("content-digest"),
+        hsigtypes.component("content-length")]
+    let params = [int_param("created", 1618884473), str_param("keyid", "test-key-rsa-pss")]
+
+    test.case("the signature base")
+    test.assert(hsigbase.signature_base(msg, None, comps, params) == Ok(joined(b23_base())))
+
+    test.case("the Signature-Input member")
+    test.assert(hsigfields.input_member("sig-b23", comps, params) == Ok(header_value(b23_hdr(), "signature-input")))
+
+@test
+fn test_b21_to_b23_signatures_are_not_checked_and_say_so()
+    test.case("no key of this package is rsa-pss-sha512")
+    test.assert(hsigalg.alg_of_verify_key(rsa_verifying()) == "rsa-v1_5-sha256")
+    let e = input_entry(b22_hdr(), "sig-b22")
+    test.assert(hsigfields.alg(e.params) == None)
+    test.assert(hsigfields.keyid(e.params) == Some("test-key-rsa-pss"))
+    test.assert(hsigfields.tag(e.params) == Some("header-example"))
+    test.case("the RFC's signature is a 256-byte value")
+    test.assert(bytes.len(signature_bytes(b22_hdr(), "sig-b22")) == 256)
+
+// ── B.2.4: ecdsa-p256-sha256 on a response ───────────────────────────
+
+@test
+fn test_b24_response_signed_with_ecdsa()
+    let msg = response_of(response_msg())
+    let comps = [hsigtypes.component("@status"),
+        hsigtypes.component("content-type"),
+        hsigtypes.component("content-digest"),
+        hsigtypes.component("content-length")]
+    let params = [int_param("created", 1618884473), str_param("keyid", "test-key-ecc-p256")]
+
+    test.case("the signature base and the Signature-Input member")
+    test.assert(hsigbase.signature_base(msg, None, comps, params) == Ok(joined(b24_base())))
+    test.assert(hsigfields.input_member("sig-b24", comps, params) == Ok(header_value(b24_hdr(), "signature-input")))
+
+    test.case("the RFC's signature verifies against the public key")
+    test.assert(hsigalg.verify(joined(b24_base()), signature_bytes(b24_hdr(), "sig-b24"), ecc_verifying()) == Ok(true))
+
+    test.case("a signature made here verifies, and is 64 bytes")
+    match httpsig.sign(msg, None, "sig-b24", comps, params, ecc_signing())
+        Err(_) => test.fail("signing")
+        Ok(s)  =>
+            test.assert(bytes.len(s.value) == 64)
+            test.assert(s.signature_input == header_value(b24_hdr(), "signature-input"))
+            test.assert(hsigalg.verify(s.base, s.value, ecc_verifying()) == Ok(true))
+
+    test.case("a changed base does not verify")
+    test.assert(hsigalg.verify(joined(b24_base()) + "x", signature_bytes(b24_hdr(), "sig-b24"), ecc_verifying()) == Ok(false))
+
+// ── B.2.5: hmac-sha256 ───────────────────────────────────────────────
+
+@test
+fn test_b25_hmac_signature_equals_the_rfc()
+    let msg = request_of(request_msg())
+    let comps = [hsigtypes.component("date"),
+        hsigtypes.component("@authority"),
+        hsigtypes.component("content-type")]
+    let params = [int_param("created", 1618884473), str_param("keyid", "test-shared-secret")]
+
+    test.case("the signature made here is the RFC's, byte for byte")
+    match httpsig.sign(msg, None, "sig-b25", comps, params, HsigHmacKey(secret_key()))
+        Err(_) => test.fail("signing")
+        Ok(s)  =>
+            test.assert(s.base == joined(b25_base()))
+            test.assert(s.signature_input == header_value(b25_hdr(), "signature-input"))
+            test.assert(s.signature == header_value(b25_hdr(), "signature"))
+            test.assert(s.value == signature_bytes(b25_hdr(), "sig-b25"))
+
+    test.case("the RFC's fields verify with the shared secret")
+    test.assert(verify_code(msg, b25_hdr(), "sig-b25", HsigHmacVerifyKey(secret_key())) == 0)
+
+    test.case("a different secret does not")
+    test.assert(verify_code(msg, b25_hdr(), "sig-b25", HsigHmacVerifyKey(bytes.from_str("another secret"))) == HSIG_ERR_VERIFY_FAILED)
+
+// ── B.2.6: ed25519 ───────────────────────────────────────────────────
+
+@test
+fn test_b26_ed25519_signature_equals_the_rfc()
+    let msg = request_of(request_msg())
+    let comps = [hsigtypes.component("date"),
+        hsigtypes.component("@method"),
+        hsigtypes.component("@path"),
+        hsigtypes.component("@authority"),
+        hsigtypes.component("content-type"),
+        hsigtypes.component("content-length")]
+    let params = [int_param("created", 1618884473), str_param("keyid", "test-key-ed25519")]
+
+    test.case("the signature made here is the RFC's, byte for byte")
+    match httpsig.sign(msg, None, "sig-b26", comps, params, ed_signing())
+        Err(_) => test.fail("signing")
+        Ok(s)  =>
+            test.assert(s.base == joined(b26_base()))
+            test.assert(s.signature_input == header_value(b26_hdr(), "signature-input"))
+            test.assert(s.signature == header_value(b26_hdr(), "signature"))
+
+    test.case("the RFC's fields verify with the public key")
+    test.assert(verify_code(msg, b26_hdr(), "sig-b26", ed_verifying()) == 0)
+
+// ── B.3: a proxy signs a Client-Cert field ───────────────────────────
+
+@test
+fn test_b3_tls_terminating_proxy()
+    let unsigned = request_of(b3_unsigned())
+    let comps = [hsigtypes.component("@path"),
+        hsigtypes.component("@query"),
+        hsigtypes.component("@method"),
+        hsigtypes.component("@authority"),
+        hsigtypes.component("client-cert")]
+    let params = [int_param("created", 1618884473), str_param("keyid", "test-key-ecc-p256")]
+
+    test.case("the signature base")
+    test.assert(hsigbase.signature_base(unsigned, None, comps, params) == Ok(joined(b3_base())))
+
+    test.case("the signed request verifies from its own fields")
+    let signed = request_of(b3_signed())
+    test.assert(verify_code(signed, b3_signed(), "ttrp", ecc_verifying()) == 0)
+
+    test.case("the signature printed beside the base is the one in the field")
+    test.assert(signature_bytes(b3_signed(), "ttrp") == from_b64(joined(b3_sig())))
+
+// ── B.4: transformations ─────────────────────────────────────────────
+
+fn b4_variant(lines: [Str]) -> Int
+    verify_code(request_of(lines), lines, "transform", ed_verifying())
+
+@test
+fn test_b4_the_signature_base_of_the_signed_message()
+    test.case("the base")
+    let msg = request_of(b4_msg())
+    let e = input_entry(b4_msg(), "transform")
+    test.assert(hsigbase.signature_base(msg, None, e.components, e.params) == Ok(joined(b4_base())))
+    test.case("the signature verifies")
+    test.assert(b4_variant(b4_msg()) == 0)
+
+@test
+fn test_b4_changes_that_leave_the_signature_valid()
+    let sig_in = header_value(b4_msg(), "signature-input")
+    let sig = header_value(b4_msg(), "signature")
+    let ed = "Signature-Input: " + sig_in
+    let es = "Signature: " + sig
+
+    test.case("an added header field and an added query parameter")
+    let added = ["GET /demo?name1=Value1&Name2=value2&param=added HTTP/1.1",
+        "Host: example.org",
+        "Date: Fri, 15 Jul 2022 14:24:55 GMT",
+        "Accept: application/json",
+        "Accept: */*",
+        "Accept-Language: en-US,en;q=0.5",
+        ed,
+        es]
+    test.assert(b4_variant(added) == 0)
+
+    test.case("a removed Date, an added Referer, and the two Accept fields collapsed into one")
+    let collapsed = ["GET /demo?name1=Value1&Name2=value2 HTTP/1.1",
+        "Host: example.org",
+        "Referer: https://developer.example.org/demo",
+        "Accept: application/json, */*",
+        ed,
+        es]
+    test.assert(b4_variant(collapsed) == 0)
+
+    test.case("the fields reordered, the two Accept fields kept in order")
+    let reordered = ["GET /demo?name1=Value1&Name2=value2 HTTP/1.1",
+        "Accept: application/json",
+        "Accept: */*",
+        "Date: Fri, 15 Jul 2022 14:24:55 GMT",
+        "Host: example.org",
+        ed,
+        es]
+    test.assert(b4_variant(reordered) == 0)
+
+@test
+fn test_b4_changes_that_break_the_signature()
+    let sig_in = header_value(b4_msg(), "signature-input")
+    let sig = header_value(b4_msg(), "signature")
+    let ed = "Signature-Input: " + sig_in
+    let es = "Signature: " + sig
+
+    test.case("the method changed to POST and the authority to example.com")
+    let changed = ["POST /demo?name1=Value1&Name2=value2 HTTP/1.1",
+        "Host: example.com",
+        "Date: Fri, 15 Jul 2022 14:24:55 GMT",
+        "Accept: application/json",
+        "Accept: */*",
+        ed,
+        es]
+    test.assert(b4_variant(changed) == HSIG_ERR_VERIFY_FAILED)
+
+    test.case("the two Accept fields swapped")
+    let swapped = ["GET /demo?name1=Value1&Name2=value2 HTTP/1.1",
+        "Host: example.org",
+        "Date: Fri, 15 Jul 2022 14:24:55 GMT",
+        "Accept: */*",
+        "Accept: application/json",
+        ed,
+        es]
+    test.assert(b4_variant(swapped) == HSIG_ERR_VERIFY_FAILED)
+
+// ── Section 4.3: two signatures on one message ───────────────────────
+
+@test
+fn test_section_4_3_the_clients_ecdsa_signature()
+    let msg = request_of(m43_client())
+    test.case("the client's own message verifies under its label")
+    test.assert(verify_code(msg, m43_client(), "sig1", ecc_verifying()) == 0)
+    test.case("and the label that is not there is not found")
+    test.assert(verify_code(msg, m43_client(), "proxy_sig", rsa_verifying()) == HSIG_ERR_NO_SIGNATURE_INPUT)
+
+@test
+fn test_section_4_3_the_proxys_rsa_signature_among_two()
+    let msg = request_of(m43_forwarded())
+
+    test.case("the proxy's base, from the Signature-Input entry that carries its label")
+    match hsigfields.parse_signature_input(header_values(m43_forwarded(), "signature-input"))
+        Err(_) => test.fail("parse")
+        Ok(es) =>
+            test.assert(list.len(es) == 2)
+            match hsigfields.find_input(es, "proxy_sig")
+                None    => test.fail("proxy_sig")
+                Some(e) =>
+                    test.assert(hsigbase.signature_base(msg, None, e.components, e.params) == Ok(joined(m43_proxy_base())))
+                    test.assert(hsigfields.alg(e.params) == Some("rsa-v1_5-sha256"))
+                    test.assert(hsigfields.expires(e.params) == Some(1618884540))
+
+    test.case("the RSASSA-PKCS1-v1_5 signature verifies")
+    test.assert(verify_code(msg, m43_forwarded(), "proxy_sig", rsa_verifying()) == 0)
+    test.assert(signature_bytes(m43_forwarded(), "proxy_sig") == from_b64(joined(m43_proxy_sig())))
+
+    test.case("the client's signature, made over another authority, no longer verifies")
+    test.assert(verify_code(msg, m43_forwarded(), "sig1", ecc_verifying()) == HSIG_ERR_VERIFY_FAILED)
+
+    test.case("the alg parameter must be the key's")
+    test.assert(verify_code(msg, m43_forwarded(), "proxy_sig", ecc_verifying()) == HSIG_ERR_ALG_MISMATCH)
+
+// ── Section 2.4: a response that signs parts of its request ──────────
+
+// The error code of a failed verification of a response against its request.
+fn verify_code_req(msg: HsigMessage, req: ?HsigMessage, lines: [Str], label: Str,
+                   key: HsigVerifyKey) -> Int
+    match httpsig.verify(msg,
+        req,
+        header_values(lines, "signature-input"),
+        header_values(lines, "signature"),
+        label,
+        key)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+@test
+fn test_section_2_4_the_response_covers_the_method_authority_path_and_digest_of_its_request()
+    let req = request_of(r24_request())
+    let resp = response_of(r24_signed())
+
+    test.case("the signature base, with req components read from the request")
+    match httpsig.prepare(resp,
+        Some(req),
+        header_values(r24_signed(), "signature-input"),
+        header_values(r24_signed(), "signature"),
+        "reqres")
+        Err(_) => test.fail("prepare")
+        Ok(p)  =>
+            test.assert(p.base == joined(r24_base()))
+            test.assert(list.len(p.components) == 7)
+
+    test.case("the RFC's signature verifies")
+    test.assert(verify_code_req(resp, Some(req), r24_signed(), "reqres", ecc_verifying()) == 0)
+
+    test.case("without the request the req components cannot be read")
+    test.assert(verify_code_req(resp, None, r24_signed(), "reqres", ecc_verifying()) == HSIG_ERR_NO_REQUEST)
+
+    test.case("a different request does not verify")
+    let other = request_of(["POST /bar?param=Value&Pet=dog HTTP/1.1",
+        "Host: example.com",
+        "Content-Digest: " + header_value(r24_request(), "content-digest")])
+    test.assert(verify_code_req(resp, Some(other), r24_signed(), "reqres", ecc_verifying()) == HSIG_ERR_VERIFY_FAILED)
+
+    test.case("a signature made here over the same components has the RFC's base and verifies")
+    let comps = [hsigtypes.component("@status"),
+        hsigtypes.component("content-digest"),
+        hsigtypes.component("content-type"),
+        hsigtypes.component_flag("@authority", "req"),
+        hsigtypes.component_flag("@method", "req"),
+        hsigtypes.component_flag("@path", "req"),
+        hsigtypes.component_flag("content-digest", "req")]
+    let params = [int_param("created", 1618884479), str_param("keyid", "test-key-ecc-p256")]
+    match httpsig.sign(resp, Some(req), "reqres", comps, params, ecc_signing())
+        Err(_) => test.fail("sign")
+        Ok(s)  =>
+            test.assert(s.base == joined(r24_base()))
+            test.assert(s.signature_input == header_value(r24_signed(), "signature-input"))
+            test.assert(hsigalg.verify(s.base, s.value, ecc_verifying()) == Ok(true))
+
+@test
+fn test_section_2_4_a_response_to_a_signed_request_covers_the_request_query_and_headers()
+    let req = request_of(r24_signed_request())
+    let resp = response_of(r24_signed2())
+    test.case("the base")
+    match httpsig.prepare(resp,
+        Some(req),
+        header_values(r24_signed2(), "signature-input"),
+        header_values(r24_signed2(), "signature"),
+        "reqres")
+        Err(_) => test.fail("prepare")
+        Ok(p)  => test.assert(p.base == joined(r24_base2()))
+    test.case("the signature verifies")
+    test.assert(verify_code_req(resp, Some(req), r24_signed2(), "reqres", ecc_verifying()) == 0)
+
+@test
+fn test_req_on_a_request_is_an_error()
+    let req = request_of(r24_request())
+    match hsigbase.component_value(req, None, hsigtypes.component_flag("@method", "req"))
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_REQ_ON_REQUEST)

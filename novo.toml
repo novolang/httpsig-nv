@@ -1,0 +1,49 @@
+[package]
+name        = "httpsig-nv"
+version     = "0.1.0"
+description = "HTTP Message Signatures for novo-lang, RFC 9421: the signature base built from derived components (@method, @target-uri, @authority, @scheme, @request-target, @path, @query, @query-param, @status) and field components (the sf, key, bs, tr and req parameters), the Signature-Input, Signature and Accept-Signature fields as structured fields, and signing and verification with hmac-sha256, ed25519 and ecdsa-p256-sha256, with rsa-v1_5-sha256 verification. The message is a record the caller fills; there is no HTTP library and no I/O."
+license     = "Apache-2.0"
+stability   = "experimental"
+
+# `core`.  A message is a record the caller fills, the signature base is a
+# string built from it, and a signature is arithmetic over that string and a
+# key the caller passes in.  The clock is an argument: the check of `created`
+# and `expires` takes the time as a number.  No function declares an effect.
+#
+# No build for a microcontroller: a message is a list of heap strings and the
+# signature base is a string of unbounded length.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["http-message-signatures", "rfc9421", "http", "signature", "hmac", "ed25519", "ecdsa", "structured-fields", "sans-io"]
+repository  = "https://github.com/novolang/httpsig-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Signing and verifying HTTP messages by RFC 9421, with the RFC's own test vectors"
+
+[dependencies]
+# sfv-nv is the field syntax of Signature-Input, Signature and
+# Accept-Signature, and of the component identifiers in the signature base.
+# A path while sfv-nv is not published; the line is recorded in
+# satellites/PATH-DEPENDENCIES.md and becomes `sfv-nv = "^0.1.0"`.
+sfv-nv = { path = "../sfv-nv" }
+
+# crypto-nv is HMAC-SHA-256 and SHA-256, and the constant-time comparison of
+# a MAC.
+crypto-nv = "^0.1.8"
+
+# ed25519-nv is the Ed25519 of RFC 8032, for the `ed25519` algorithm.
+ed25519-nv = "^0.1.1"
+
+# p256-nv is ECDSA over P-256, for the `ecdsa-p256-sha256` algorithm.
+p256-nv = "^0.1.1"
+
+# rsa-nv verifies RSASSA-PKCS1-v1_5 with SHA-256, for `rsa-v1_5-sha256`.  It
+# has no SHA-512 and no signing.
+rsa-nv = "^0.1.0"

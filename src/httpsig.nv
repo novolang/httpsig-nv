@@ -1,0 +1,250 @@
+// httpsig.nv — signing and verifying a message, RFC 9421 section 3.
+//
+// `sign` takes a message, the covered components, the signature parameters
+// and a key, and answers the two field members to add to the message: one
+// for `Signature-Input` and one for `Signature`.  `verify` takes the message,
+// the lines of the two fields, the label of the signature to check and a key,
+// and answers what the signature said, or an error.
+//
+// This package sends and receives nothing.  The caller reads the fields off
+// the message it has and puts the members on the message it sends.
+//
+// THE STEPS OF VERIFICATION (section 3.2) are in `prepare` and
+// `verify_prepared`, so a caller that has an algorithm this package lacks
+// calls `prepare` for the signature base and the signature bytes and checks
+// them itself.  `verify` is the two together.
+//
+// WHAT THE CALLER STILL DECIDES.  Which key a `keyid` names, whether the
+// time of `created` and `expires` is acceptable, and which components a
+// signature must cover for the application (section 3.2.1) are the caller's.
+// `check_time` and `check_covered` answer the last two.
+
+use std.list
+use std.str
+use hsigalg
+use hsigbase
+use hsigfields
+use hsigtypes
+use sfvtypes
+
+// A signature made: the two members for the message's fields, and the base
+// and bytes they were made from.
+pub struct HsigSigned
+    label: Str
+    // `label=(...)...`, a member for the `Signature-Input` field.
+    signature_input: Str
+    // `label=:...:`, a member for the `Signature` field.
+    signature: Str
+    // The signature base that was signed.
+    base: Str
+    // The signature bytes.
+    value: Bytes
+
+// Sign a message.
+//
+// `req` is the request a response answers, for a component with the `req`
+// parameter, and `None` otherwise.  `params` are the signature parameters in
+// the order they are to be written: `created`, `expires`, `nonce`, `alg`,
+// `keyid` and `tag`, or others.  An `alg` among them must be the algorithm of
+// the key.  The label must be a valid key: lower-case letters, digits, and
+// `_ - . *`.
+//
+// ```novo
+// use std.bytes
+// use hsigalg
+// use hsigmsg
+// use hsigtypes
+// use httpsig
+// use sfvtypes
+//
+// fn main() [io]
+//     match hsigmsg.request("GET", "https://example.com/x", [hsigtypes.field("Date", "Tue, 20 Apr 2021 02:07:55 GMT")])
+//         Err(e) => println(e.message())
+//         Ok(m) =>
+//             let comps = [hsigtypes.component("@method"), hsigtypes.component("date")]
+//             let params = [sfvtypes.param("created", SfvInteger(1618884473)), sfvtypes.param("keyid", SfvString("k1"))]
+//             match httpsig.sign(m, None, "sig1", comps, params, HsigHmacKey(bytes.from_str("secret")))
+//                 Ok(s) => println(s.signature_input)   // sig1=("@method" "date");created=1618884473;keyid="k1"
+//                 Err(e) => println(e.message())
+// ```
+pub fn sign(msg: HsigMessage, req: ?HsigMessage, label: Str, components: [HsigComponent],
+            params: [SfvParam], key: HsigKey) -> Result<HsigSigned, HsigError> []
+    match hsigfields.alg(params)
+        Some(a) =>
+            if a != hsigalg.alg_of_key(key)
+                return Err(hsigtypes.error(HSIG_ERR_ALG_MISMATCH, a))
+        None    => ()
+    match hsigbase.signature_base(msg, req, components, params)
+        Err(e)   => Err(e)
+        Ok(base) =>
+            match hsigalg.sign(base, key)
+                Err(e)    => Err(e)
+                Ok(value) =>
+                    match hsigfields.input_member(label, components, params)
+                        Err(e)    => Err(e)
+                        Ok(input) =>
+                            match hsigfields.signature_member(label, value)
+                                // cov: skip — input_member checked the label, and signature_member checks the same rule
+                                Err(e)  => Err(e)
+                                Ok(sig) => Ok(HsigSigned { label: label,
+                                    signature_input: input,
+                                    signature: sig,
+                                    base: base,
+                                    value: value })
+
+// A signature found in a message, with its signature base rebuilt.
+pub struct HsigPrepared
+    label: Str
+    components: [HsigComponent]
+    params: [SfvParam]
+    // The signature base rebuilt from the message and the Signature-Input
+    // entry.
+    base: Str
+    // The signature bytes from the `Signature` field.
+    signature: Bytes
+
+// Find a signature in a message and rebuild its signature base (section
+// 3.2, steps 1, 2, 3 and 7).
+//
+// `input_lines` are the lines of the `Signature-Input` field and
+// `signature_lines` those of the `Signature` field.  The answer is an error
+// when either field is malformed, when the label is missing from either, or
+// when the base cannot be built from the message.
+pub fn prepare(msg: HsigMessage, req: ?HsigMessage, input_lines: [Str], signature_lines: [Str],
+               label: Str) -> Result<HsigPrepared, HsigError> []
+    match hsigfields.parse_signature_input(input_lines)
+        Err(e)     => Err(e)
+        Ok(inputs) =>
+            match hsigfields.parse_signature(signature_lines)
+                Err(e)   => Err(e)
+                Ok(sigs) =>
+                    match hsigfields.find_input(inputs, label)
+                        None        => Err(hsigtypes.error(HSIG_ERR_NO_SIGNATURE_INPUT, label))
+                        Some(entry) =>
+                            match hsigfields.find_signature(sigs, label)
+                                None    => Err(hsigtypes.error(HSIG_ERR_NO_SIGNATURE, label))
+                                Some(s) =>
+                                    match hsigbase.signature_base(msg, req, entry.components, entry.params)
+                                        Err(e)   => Err(e)
+                                        Ok(base) => Ok(HsigPrepared { label: label,
+                                            components: entry.components,
+                                            params: entry.params,
+                                            base: base,
+                                            signature: s.signature })
+
+// What a verified signature said about itself.
+pub struct HsigVerified
+    label: Str
+    components: [HsigComponent]
+    params: [SfvParam]
+    created: ?Int
+    expires: ?Int
+    nonce: ?Str
+    alg: ?Str
+    keyid: ?Str
+    tag: ?Str
+
+// Verify a prepared signature with `key` (section 3.2, steps 6 and 8).
+//
+// An `alg` parameter must name the algorithm of the key; it is never used to
+// choose one.  The answer is the signature's own description when it
+// verifies and `HSIG_ERR_VERIFY_FAILED` when it does not.
+pub fn verify_prepared(p: HsigPrepared, key: HsigVerifyKey) -> Result<HsigVerified, HsigError> []
+    match hsigfields.alg(p.params)
+        Some(a) =>
+            if a != hsigalg.alg_of_verify_key(key)
+                return Err(hsigtypes.error(HSIG_ERR_ALG_MISMATCH, a))
+        None    => ()
+    match hsigalg.verify(p.base, p.signature, key)
+        Err(e)   => Err(e)
+        Ok(good) =>
+            if not good
+                return Err(hsigtypes.error(HSIG_ERR_VERIFY_FAILED, p.label))
+            Ok(HsigVerified { label: p.label,
+                components: p.components,
+                params: p.params,
+                created: hsigfields.created(p.params),
+                expires: hsigfields.expires(p.params),
+                nonce: hsigfields.nonce(p.params),
+                alg: hsigfields.alg(p.params),
+                keyid: hsigfields.keyid(p.params),
+                tag: hsigfields.tag(p.params) })
+
+// Verify the signature called `label` in a message.
+//
+// ```novo
+// use std.bytes
+// use hsigalg
+// use hsigmsg
+// use hsigtypes
+// use httpsig
+// use sfvtypes
+//
+// fn main() [io]
+//     let secret = bytes.from_str("secret")
+//     match hsigmsg.request("GET", "https://example.com/x", [hsigtypes.field("Date", "Tue, 20 Apr 2021 02:07:55 GMT")])
+//         Err(e) => println(e.message())
+//         Ok(m) =>
+//             match httpsig.sign(m, None, "sig1", [hsigtypes.component("@method")], [], HsigHmacKey(secret))
+//                 Err(e) => println(e.message())
+//                 Ok(s) =>
+//                     match httpsig.verify(m, None, [s.signature_input], [s.signature], "sig1", HsigHmacVerifyKey(secret))
+//                         Ok(v) => println("verified ${v.label}")   // verified sig1
+//                         Err(e) => println(e.message())
+// ```
+pub fn verify(msg: HsigMessage, req: ?HsigMessage, input_lines: [Str], signature_lines: [Str],
+              label: Str, key: HsigVerifyKey) -> Result<HsigVerified, HsigError> []
+    match prepare(msg, req, input_lines, signature_lines, label)
+        Err(e) => Err(e)
+        Ok(p)  => verify_prepared(p, key)
+
+// Check the times of a signature against the time `now`, in seconds since
+// the Unix epoch, allowing `skew` seconds either way.
+//
+// A signature whose `expires` is more than `skew` seconds in the past is
+// `HSIG_ERR_EXPIRED`, and one whose `created` is more than `skew` seconds
+// ahead is `HSIG_ERR_FROM_FUTURE`.  A signature with neither passes.  How old
+// a `created` may be is the application's: compare `v.created` itself.
+//
+// ```novo
+// use hsigfields
+// use httpsig
+// use sfvtypes
+//
+// fn main() [io]
+//     let ps = [sfvtypes.param("created", SfvInteger(100)), sfvtypes.param("expires", SfvInteger(200))]
+//     match httpsig.check_time(ps, 250, 0)
+//         Some(e) => println(e.message())   // signature has expired
+//         None => println("ok")
+// ```
+pub fn check_time(params: [SfvParam], now: Int, skew: Int) -> ?HsigError []
+    match hsigfields.expires(params)
+        Some(t) =>
+            if now > t + skew
+                return Some(hsigtypes.error(HSIG_ERR_EXPIRED, str.from_int(t)))
+        None    => ()
+    match hsigfields.created(params)
+        Some(t) =>
+            if t > now + skew
+                return Some(hsigtypes.error(HSIG_ERR_FROM_FUTURE, str.from_int(t)))
+        None    => ()
+    None
+
+// Check that a signature covers every one of the `required` components
+// (section 3.2.1).  The answer names the first one it does not.  A component
+// is covered when a component with the same name and the same parameters, in
+// the same order, is.
+pub fn check_covered(covered: [HsigComponent], required: [HsigComponent]) -> ?HsigError []
+    var ids: [Str] = []
+    for c in covered
+        match hsigbase.identifier(c)
+            Ok(t)  => list.push(ids, t)
+            Err(_) => ()
+    for r in required
+        match hsigbase.identifier(r)
+            Err(e) =>
+                return Some(e)
+            Ok(t)  =>
+                if not list.contains(ids, t)
+                    return Some(hsigtypes.error(HSIG_ERR_NOT_COVERED, t))
+    None

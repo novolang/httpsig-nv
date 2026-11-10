@@ -1,0 +1,339 @@
+// hsigtypes.nv — the message, the covered components, and the errors.
+//
+// RFC 9421 signs a set of parts of an HTTP message.  This package never
+// sees a socket or an HTTP library: the caller describes the message in an
+// `HsigMessage` and the package reads the parts it needs from it.
+//
+// A MESSAGE is a request or a response.  A request has a method, a scheme,
+// an authority, a path and, when it has one, a query, which are the parts of
+// the target URI.  A response has a status.  Either has header fields and,
+// optionally, trailer fields, each a name and a value, in the order they
+// occur.  Several fields with one name are several entries.  A field value
+// is the text after the colon, with the leading and trailing white space
+// already removed or not; the package removes it.
+//
+// A COVERED COMPONENT is named by a string: a field name in lower case, or
+// a derived component such as `@method`, and it may carry parameters such as
+// `sf`, `key`, `bs`, `req`, `tr` and `name`.  The parameters are an ordered
+// list of the `SfvParam` values of sfv-nv, because their order is part of
+// the signature.
+//
+// A variant is constructed by name across a whole assembly, so the variants
+// here carry the prefix `Hsig`.
+
+use std.str
+use sfvtypes
+
+// ── Errors ───────────────────────────────────────────────────────────
+
+// A covered field is not in the message.
+pub const HSIG_ERR_MISSING_FIELD = 1
+// A derived component name that this package does not know.
+pub const HSIG_ERR_UNKNOWN_COMPONENT = 2
+// A component parameter that is unknown, has the wrong type of value, or
+// does not apply to the component.
+pub const HSIG_ERR_BAD_PARAMETER = 3
+// Parameters that cannot be used together: `bs` with `sf` or `key`.
+pub const HSIG_ERR_INCOMPATIBLE = 4
+// The same component identifier twice.
+pub const HSIG_ERR_DUPLICATE_COMPONENT = 5
+// The `req` parameter on a component of a request.
+pub const HSIG_ERR_REQ_ON_REQUEST = 6
+// The `req` parameter on a component of a response, with no request given.
+pub const HSIG_ERR_NO_REQUEST = 7
+// A derived component that does not apply to this kind of message: `@status`
+// on a request, or a request component on a response without `req`.
+pub const HSIG_ERR_WRONG_MESSAGE = 8
+// `sf` or `key` on a field whose Structured Field type is not known.
+pub const HSIG_ERR_UNKNOWN_FIELD_TYPE = 9
+// A field value that is not a valid Structured Field of its type, or that
+// holds a line break.
+pub const HSIG_ERR_BAD_FIELD_VALUE = 10
+// A Dictionary member or a query parameter that is not there.
+pub const HSIG_ERR_MISSING_MEMBER = 11
+// A query parameter name that occurs more than once.
+pub const HSIG_ERR_AMBIGUOUS = 12
+// A signature base that holds a byte outside ASCII.
+pub const HSIG_ERR_NOT_ASCII = 13
+// `@signature-params` among the covered components.
+pub const HSIG_ERR_SIGNATURE_PARAMS_COMPONENT = 14
+// A target URI that is not `scheme://authority/path?query`.
+pub const HSIG_ERR_BAD_TARGET = 15
+// Components or parameters that cannot be written as a Structured Field.
+pub const HSIG_ERR_UNSERIALISABLE = 16
+// A `Signature-Input`, `Signature` or `Accept-Signature` field that is not
+// a Dictionary of the shape RFC 9421 section 4 gives it.
+pub const HSIG_ERR_BAD_FIELD = 17
+// A label in `Signature-Input` with no entry in `Signature`.
+pub const HSIG_ERR_NO_SIGNATURE = 18
+// A label in `Signature` with no entry in `Signature-Input`.
+pub const HSIG_ERR_NO_SIGNATURE_INPUT = 19
+// An `alg` parameter, or a key, for an algorithm this package does not
+// implement.
+pub const HSIG_ERR_UNSUPPORTED_ALG = 20
+// An `alg` parameter that does not name the algorithm of the key.
+pub const HSIG_ERR_ALG_MISMATCH = 21
+// Key material of the wrong length or that is not a key.
+pub const HSIG_ERR_BAD_KEY = 22
+// A signature value of the wrong length for its algorithm.
+pub const HSIG_ERR_BAD_SIGNATURE = 23
+// The signature does not verify.
+pub const HSIG_ERR_VERIFY_FAILED = 24
+// The signature's expiry time has passed.
+pub const HSIG_ERR_EXPIRED = 25
+// The signature's creation time is later than now.
+pub const HSIG_ERR_FROM_FUTURE = 26
+// A required covered component is not covered.
+pub const HSIG_ERR_NOT_COVERED = 27
+// A component name that is empty or is not in lower case.
+pub const HSIG_ERR_BAD_NAME = 28
+
+// What went wrong, and about what.
+//
+// `code` is one of the `HSIG_ERR_` constants.  `detail` names the component,
+// parameter or label involved, or is empty.
+pub struct HsigError
+    code: Int
+    detail: Str
+
+// A sentence for an error code.
+pub fn code_message(code: Int) -> Str []
+    if code == HSIG_ERR_MISSING_FIELD
+        return "covered field is not in the message"
+    if code == HSIG_ERR_UNKNOWN_COMPONENT
+        return "unknown derived component"
+    if code == HSIG_ERR_BAD_PARAMETER
+        return "unknown or inapplicable component parameter"
+    if code == HSIG_ERR_INCOMPATIBLE
+        return "component parameters cannot be used together"
+    if code == HSIG_ERR_DUPLICATE_COMPONENT
+        return "component covered twice"
+    if code == HSIG_ERR_REQ_ON_REQUEST
+        return "req parameter on a request"
+    if code == HSIG_ERR_NO_REQUEST
+        return "req parameter with no request given"
+    if code == HSIG_ERR_WRONG_MESSAGE
+        return "component does not apply to this kind of message"
+    if code == HSIG_ERR_UNKNOWN_FIELD_TYPE
+        return "Structured Field type of the field is not known"
+    if code == HSIG_ERR_BAD_FIELD_VALUE
+        return "field value is not valid"
+    if code == HSIG_ERR_MISSING_MEMBER
+        return "Dictionary member or query parameter not found"
+    if code == HSIG_ERR_AMBIGUOUS
+        return "query parameter occurs more than once"
+    if code == HSIG_ERR_NOT_ASCII
+        return "signature base is not ASCII"
+    if code == HSIG_ERR_SIGNATURE_PARAMS_COMPONENT
+        return "@signature-params cannot be a covered component"
+    if code == HSIG_ERR_BAD_TARGET
+        return "target URI is not scheme://authority/path?query"
+    if code == HSIG_ERR_UNSERIALISABLE
+        return "value cannot be written as a Structured Field"
+    if code == HSIG_ERR_BAD_FIELD
+        return "signature field is malformed"
+    if code == HSIG_ERR_NO_SIGNATURE
+        return "no Signature for the label"
+    if code == HSIG_ERR_NO_SIGNATURE_INPUT
+        return "no Signature-Input for the label"
+    if code == HSIG_ERR_UNSUPPORTED_ALG
+        return "algorithm is not supported"
+    if code == HSIG_ERR_ALG_MISMATCH
+        return "alg does not match the key"
+    if code == HSIG_ERR_BAD_KEY
+        return "malformed key"
+    if code == HSIG_ERR_BAD_SIGNATURE
+        return "signature has the wrong length"
+    if code == HSIG_ERR_VERIFY_FAILED
+        return "signature does not verify"
+    if code == HSIG_ERR_EXPIRED
+        return "signature has expired"
+    if code == HSIG_ERR_FROM_FUTURE
+        return "signature was created in the future"
+    if code == HSIG_ERR_NOT_COVERED
+        return "required component is not covered"
+    if code == HSIG_ERR_BAD_NAME
+        return "component name is empty or not in lower case"
+    "unknown error"
+
+impl Error for HsigError
+    // The sentence for the error's code, and the detail when there is one.
+    fn message(self) -> Str
+        if self.detail == ""
+            return code_message(self.code)
+        code_message(self.code) + ": " + self.detail
+
+// An error with a code and a detail.
+pub fn error(code: Int, detail: Str) -> HsigError []
+    HsigError { code: code, detail: detail }
+
+// ── The message ──────────────────────────────────────────────────────
+
+// A message is a request.
+pub const HSIG_REQUEST = 1
+// A message is a response.
+pub const HSIG_RESPONSE = 2
+
+// The Structured Field type of a field: an Item.
+pub const HSIG_SF_ITEM = 1
+// The Structured Field type of a field: a List.
+pub const HSIG_SF_LIST = 2
+// The Structured Field type of a field: a Dictionary.
+pub const HSIG_SF_DICT = 3
+
+// One field line: a name and a value.
+pub struct HsigField
+    name: Str
+    value: Str
+
+// The Structured Field type of a field, for the `sf` and `key` parameters.
+pub struct HsigFieldType
+    name: Str
+    kind: Int
+
+// An HTTP message, described by the caller.
+//
+// For a request, `method`, `scheme`, `authority`, `path` and `query` are the
+// parts of the target URI, as received and not decoded.  An empty `path` is
+// read as `/`.  `query` is `None` when the URI has no `?`, and `Some("")`
+// when it has a `?` and nothing after it.  `request_target` is the request
+// target as it appeared on the request line, and is needed only for
+// `@request-target` when that is not the origin form (path and query).
+// For a response, `status` is the status code.
+pub struct HsigMessage
+    kind: Int
+    method: Str
+    scheme: Str
+    authority: Str
+    path: Str
+    query: ?Str
+    status: Int
+    headers: [HsigField]
+    trailers: [HsigField]
+    request_target: ?Str
+    field_types: [HsigFieldType]
+
+// A field line.
+pub fn field(name: Str, value: Str) -> HsigField []
+    HsigField { name: name, value: value }
+
+// A response with a status and header fields.
+pub fn response(status: Int, headers: [HsigField]) -> HsigMessage []
+    HsigMessage { kind: HSIG_RESPONSE,
+        method: "",
+        scheme: "",
+        authority: "",
+        path: "",
+        query: None,
+        status: status,
+        headers: headers,
+        trailers: [],
+        request_target: None,
+        field_types: [] }
+
+// A copy of a message with trailer fields.
+pub fn with_trailers(msg: HsigMessage, trailers: [HsigField]) -> HsigMessage []
+    HsigMessage { kind: msg.kind,
+        method: msg.method,
+        scheme: msg.scheme,
+        authority: msg.authority,
+        path: msg.path,
+        query: msg.query,
+        status: msg.status,
+        headers: msg.headers,
+        trailers: trailers,
+        request_target: msg.request_target,
+        field_types: msg.field_types }
+
+// A copy of a request with the request target as it was received, for
+// `@request-target` when that is not the origin form.
+pub fn with_request_target(msg: HsigMessage, target: Str) -> HsigMessage []
+    HsigMessage { kind: msg.kind,
+        method: msg.method,
+        scheme: msg.scheme,
+        authority: msg.authority,
+        path: msg.path,
+        query: msg.query,
+        status: msg.status,
+        headers: msg.headers,
+        trailers: msg.trailers,
+        request_target: Some(target),
+        field_types: msg.field_types }
+
+// A copy of a message that knows the Structured Field type of more fields,
+// for the `sf` and `key` parameters.
+pub fn with_field_types(msg: HsigMessage, types: [HsigFieldType]) -> HsigMessage []
+    HsigMessage { kind: msg.kind,
+        method: msg.method,
+        scheme: msg.scheme,
+        authority: msg.authority,
+        path: msg.path,
+        query: msg.query,
+        status: msg.status,
+        headers: msg.headers,
+        trailers: msg.trailers,
+        request_target: msg.request_target,
+        field_types: types }
+
+// The Structured Field type of a field, for `with_field_types`.
+pub fn field_type_of(name: Str, kind: Int) -> HsigFieldType []
+    HsigFieldType { name: name, kind: kind }
+
+// The Structured Field type of a field, by name, for the fields the
+// registries define as Structured Fields and that a signature commonly
+// covers.  The comparison is on the lower-case name.  Anything else is
+// `0`, unknown.
+pub fn known_field_type(name: Str) -> Int []
+    let n = str.lower(name)
+    if n == "signature" or n == "signature-input" or n == "accept-signature" or n == "content-digest" or n == "repr-digest" or n == "want-content-digest" or n == "want-repr-digest" or n == "priority" or n == "cdn-cache-control"
+        return HSIG_SF_DICT
+    if n == "cache-status" or n == "proxy-status" or n == "accept-ch" or n == "client-cert-chain"
+        return HSIG_SF_LIST
+    if n == "client-cert"
+        return HSIG_SF_ITEM
+    0
+
+// The Structured Field type of a field in a message: the types the caller
+// listed first, then the built-in table.
+pub fn field_type(msg: HsigMessage, name: Str) -> Int []
+    let n = str.lower(name)
+    for t in msg.field_types
+        if str.lower(t.name) == n
+            return t.kind
+    known_field_type(n)
+
+// ── Components ───────────────────────────────────────────────────────
+
+// A covered component: a name and parameters in order.
+//
+// The name of a field is in lower case; the name of a derived component
+// starts with `@`.
+pub struct HsigComponent
+    name: Str
+    params: [SfvParam]
+
+// A component with no parameters.
+pub fn component(name: Str) -> HsigComponent []
+    let none: [SfvParam] = []
+    HsigComponent { name: name, params: none }
+
+// A component with parameters.
+pub fn component_with(name: Str, params: [SfvParam]) -> HsigComponent []
+    HsigComponent { name: name, params: params }
+
+// A component with one Boolean flag parameter: `sf`, `bs`, `req` or `tr`.
+pub fn component_flag(name: Str, flag: Str) -> HsigComponent []
+    HsigComponent { name: name, params: [sfvtypes.param(flag, SfvBoolean(true))] }
+
+// A Dictionary member of a field: `"name";key="member"`.
+pub fn component_key(name: Str, member: Str) -> HsigComponent []
+    HsigComponent { name: name, params: [sfvtypes.param("key", SfvString(member))] }
+
+// A named query parameter: `"@query-param";name="param"`.
+pub fn component_query_param(param: Str) -> HsigComponent []
+    HsigComponent { name: "@query-param", params: [sfvtypes.param("name", SfvString(param))] }
+
+// The covered component, as the String Item the Signature-Input field
+// writes.
+pub fn component_item(c: HsigComponent) -> SfvItem []
+    sfvtypes.item_with(SfvString(c.name), c.params)

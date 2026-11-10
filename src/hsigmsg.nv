@@ -1,0 +1,275 @@
+// hsigmsg.nv — reading the parts of a message that a signature covers.
+//
+// RFC 9421 section 2.1 gives the value of a field: the field lines of that
+// name, each stripped of leading and trailing white space and of obsolete
+// line folding, joined with a comma and a space.  Section 2.2 gives the
+// derived components: the method, the parts of the target URI, the status.
+// This module is those rules and the helpers under them, without the
+// parameters (`sf`, `key`, `bs`) that `hsigbase` applies on top.
+
+use std.list
+use std.str
+use hsigtypes
+
+// A request from its method, its target URI and its header fields.
+//
+// The target URI is the absolute form: `scheme://authority/path?query`,
+// with an optional `#fragment` that is dropped.  The scheme is lowered.  The
+// authority, path and query are kept as written.
+//
+// ```novo
+// use hsigmsg
+// use hsigtypes
+//
+// fn main() [io]
+//     match hsigmsg.request("POST", "https://example.com/foo?param=Value", [hsigtypes.field("Host", "example.com")])
+//         Ok(m) => println(m.path)   // /foo
+//         Err(e) => println(e.message())
+// ```
+pub fn request(method: Str, target_uri: Str,
+               headers: [HsigField]) -> Result<HsigMessage, HsigError> []
+    match str.index(target_uri, "://")
+        None     => Err(hsigtypes.error(HSIG_ERR_BAD_TARGET, target_uri))
+        Some(at) =>
+            let scheme = str.lower(str.slice(target_uri, 0, at))
+            if scheme == ""
+                return Err(hsigtypes.error(HSIG_ERR_BAD_TARGET, target_uri))
+            var rest = str.slice(target_uri, at + 3, str.len(target_uri))
+            match str.index(rest, "#")
+                Some(h) =>
+                    rest = str.slice(rest, 0, h)
+                None    => ()
+            var query: ?Str = None
+            match str.index(rest, "?")
+                Some(q) =>
+                    query = Some(str.slice(rest, q + 1, str.len(rest)))
+                    rest = str.slice(rest, 0, q)
+                None    => ()
+            var authority = rest
+            var target_path = ""
+            match str.index(rest, "/")
+                Some(s) =>
+                    authority = str.slice(rest, 0, s)
+                    target_path = str.slice(rest, s, str.len(rest))
+                None    => ()
+            if authority == ""
+                return Err(hsigtypes.error(HSIG_ERR_BAD_TARGET, target_uri))
+            Ok(HsigMessage { kind: HSIG_REQUEST,
+                method: method,
+                scheme: scheme,
+                authority: authority,
+                path: target_path,
+                query: query,
+                status: 0,
+                headers: headers,
+                trailers: [],
+                request_target: None,
+                field_types: [] })
+
+// Whether a byte is a space or a horizontal tab.
+fn is_ws(b: Int) -> Bool []
+    b == ' ' or b == '\t'
+
+// A field value with obsolete line folding replaced by one space and the
+// white space at both ends removed (RFC 9421 section 2.1).
+//
+// A fold is a line break (CR LF, or LF alone) followed by spaces or tabs.
+// A line break that is not followed by white space is kept, and the caller
+// refuses a value that still holds one.
+//
+// ```novo
+// use hsigmsg
+//
+// fn main() [io]
+//     println(hsigmsg.clean_value("  Obsolete\r\n    line folding. "))   // Obsolete line folding.
+// ```
+pub fn clean_value(v: Str) -> Str []
+    let n = str.len(v)
+    var out = ""
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(v, i, 0)
+        var brk = 0
+        if b == '\r' and str.byte_at_or(v, i + 1, 0) == '\n'
+            brk = 2
+        else if b == '\n'
+            brk = 1
+        if brk > 0 and is_ws(str.byte_at_or(v, i + brk, 0))
+            var j = i + brk
+            while j < n and is_ws(str.byte_at_or(v, j, 0))
+                j = j + 1
+            out = out + " "
+            i = j
+        else
+            out = out + str.from_byte(b)
+            i = i + 1
+    // Strip both ends.
+    var lo = 0
+    var hi = str.len(out)
+    while lo < hi and is_ws(str.byte_at_or(out, lo, 0))
+        lo = lo + 1
+    while hi > lo and is_ws(str.byte_at_or(out, hi - 1, 0))
+        hi = hi - 1
+    str.slice(out, lo, hi)
+
+// The cleaned values of the field lines called `name`, in order.  The name
+// is compared without regard to case.
+pub fn field_lines(fields: [HsigField], name: Str) -> [Str] []
+    let want = str.lower(name)
+    var out: [Str] = []
+    for f in fields
+        if str.lower(f.name) == want
+            list.push(out, clean_value(f.value))
+    out
+
+// The cleaned values of the lines called `name` in the trailers of a
+// message when `trailer` is true, in its headers otherwise.
+pub fn message_lines(msg: HsigMessage, trailer: Bool, name: Str) -> [Str] []
+    if trailer
+        return field_lines(msg.trailers, name)
+    field_lines(msg.headers, name)
+
+// The authority of a message as `@authority` writes it (RFC 9110 section
+// 4.2.3): in lower case, with the default port of the scheme removed, and an
+// empty port removed.
+pub fn authority_value(msg: HsigMessage) -> Str []
+    var a = str.lower(msg.authority)
+    if str.ends_with(a, ":")
+        a = str.slice(a, 0, str.len(a) - 1)
+    if msg.scheme == "http" and str.ends_with(a, ":80")
+        a = str.slice(a, 0, str.len(a) - 3)
+    if msg.scheme == "https" and str.ends_with(a, ":443")
+        a = str.slice(a, 0, str.len(a) - 4)
+    a
+
+// The value of `@target-uri`: the scheme, `://`, the authority as given, the
+// path (`/` when empty) and the query with its `?`.
+pub fn target_uri_value(msg: HsigMessage) -> Str []
+    var uri = msg.scheme + "://" + msg.authority + path_value(msg)
+    match msg.query
+        Some(q) =>
+            uri = uri + "?" + q
+        None    => ()
+    uri
+
+// The value of `@path`: the path, or `/` when it is empty.
+pub fn path_value(msg: HsigMessage) -> Str []
+    if msg.path == ""
+        return "/"
+    msg.path
+
+// The value of `@query`: `?` and the query, or `?` alone when there is none.
+pub fn query_value(msg: HsigMessage) -> Str []
+    match msg.query
+        Some(q) => "?" + q
+        None    => "?"
+
+// The value of `@request-target`: the request target as it was received when
+// the caller gave it, otherwise the origin form, the path and the query.
+pub fn request_target_value(msg: HsigMessage) -> Str []
+    match msg.request_target
+        Some(t) => t
+        None    =>
+            match msg.query
+                Some(q) => path_value(msg) + "?" + q
+                None    => path_value(msg)
+
+// ── Query parameters ─────────────────────────────────────────────────
+
+// A byte that stays unescaped when a query parameter is written: a letter,
+// a digit, or one of `-`, `.`, `_`, `~`.
+fn is_plain(b: Int) -> Bool []
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9' or b == '-' or b == '.' or b == '_' or b == '~'
+
+// The value of a hexadecimal digit of either case, or -1.
+fn hex_value(b: Int) -> Int []
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    if b >= 'A' and b <= 'F'
+        return b - 'A' + 10
+    -1
+
+// The upper-case hexadecimal digit for 0 to 15.
+fn hex_digit(v: Int) -> Str []
+    if v < 10
+        return str.from_byte('0' + v)
+    str.from_byte('A' + v - 10)
+
+// Decode a query name or value as application/x-www-form-urlencoded does:
+// `+` is a space and `%XX` is the byte it names.  A `%` not followed by two
+// hexadecimal digits is kept.
+fn form_decode(s: Str) -> Str []
+    let n = str.len(s)
+    var out = ""
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b == '+'
+            out = out + " "
+            i = i + 1
+        else if b == '%' and hex_value(str.byte_at_or(s, i + 1, 0)) >= 0 and hex_value(str.byte_at_or(s, i + 2, 0)) >= 0
+            out = out + str.from_byte(hex_value(str.byte_at_or(s, i + 1, 0)) * 16 + hex_value(str.byte_at_or(s, i + 2, 0)))
+            i = i + 3
+        else
+            out = out + str.from_byte(b)
+            i = i + 1
+    out
+
+// Encode a decoded query name or value: every byte but a letter, a digit and
+// `- . _ ~` becomes `%` and two upper-case hexadecimal digits, so a space is
+// `%20`.
+//
+// ```novo
+// use hsigmsg
+//
+// fn main() [io]
+//     println(hsigmsg.form_encode("with plus whitespace"))   // with%20plus%20whitespace
+// ```
+pub fn form_encode(s: Str) -> Str []
+    var out = ""
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if is_plain(b)
+            out = out + str.from_byte(b)
+        else
+            out = out + "%" + hex_digit(b / 16) + hex_digit(b % 16)
+    out
+
+// The value of the named query parameter, as `@query-param` writes it.
+//
+// The query is split at `&` into names and values at the first `=`, and each
+// is decoded and encoded again (RFC 9421 section 2.2.8).  `name` is compared
+// with the re-encoded names.  It is an error for the name to be absent, and
+// for it to occur twice.
+//
+// ```novo
+// use hsigmsg
+//
+// fn main() [io]
+//     match hsigmsg.query_param_value(Some("param=Value&Pet=dog"), "Pet")
+//         Ok(v) => println(v)   // dog
+//         Err(e) => println(e.message())
+// ```
+pub fn query_param_value(query: ?Str, name: Str) -> Result<Str, HsigError> []
+    let q = query ?? ""
+    var found = 0
+    var value = ""
+    for piece in str.split(q, "&")
+        if piece != ""
+            var key = piece
+            var val = ""
+            match str.index(piece, "=")
+                Some(e) =>
+                    key = str.slice(piece, 0, e)
+                    val = str.slice(piece, e + 1, str.len(piece))
+                None    => ()
+            if form_encode(form_decode(key)) == name
+                found = found + 1
+                value = form_encode(form_decode(val))
+    if found == 0
+        return Err(hsigtypes.error(HSIG_ERR_MISSING_MEMBER, name))
+    if found > 1
+        return Err(hsigtypes.error(HSIG_ERR_AMBIGUOUS, name))
+    Ok(value)

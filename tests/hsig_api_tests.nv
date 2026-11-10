@@ -1,0 +1,510 @@
+// hsig_api_tests.nv — the fields, the algorithms and the signing API.
+//
+// The vectors of `appendix_b_tests.nv` prove that a signature made or read
+// here is the RFC's.  This file holds the rest: the shape of the three
+// fields and what is refused in them, the Accept-Signature exchange of
+// section 5, the error each key and signature mistake gives, the checks of
+// time and coverage, and the mistakes a caller can make when signing.
+
+use std.bytes
+use std.list
+use std.str
+use std.test
+use hsigalg
+use hsigfields
+use hsigmsg
+use hsigtypes
+use httpsig
+use sfvtypes
+
+fn f(name: Str, v: Str) -> HsigField
+    hsigtypes.field(name, v)
+
+fn msg() -> HsigMessage
+    match hsigmsg.request("POST", "https://example.com/foo?param=Value", [f("Host", "example.com"),
+        f("Date", "Tue, 20 Apr 2021 02:07:55 GMT"),
+        f("Content-Type", "application/json")])
+        Ok(m)  => m
+        Err(_) => hsigtypes.response(0, [])
+
+fn secret() -> Bytes
+    bytes.from_str("a shared secret of some length")
+
+fn comps() -> [HsigComponent]
+    [hsigtypes.component("@method"), hsigtypes.component("@authority"), hsigtypes.component("date")]
+
+fn created(n: Int) -> [SfvParam]
+    [sfvtypes.param("created", SfvInteger(n))]
+
+// The error code of a signing attempt, or 0.
+fn sign_code(m: HsigMessage, label: Str, cs: [HsigComponent], ps: [SfvParam], key: HsigKey) -> Int
+    match httpsig.sign(m, None, label, cs, ps, key)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+// The error code of a verification, or 0.
+fn verify_code(m: HsigMessage, input: [Str], sig: [Str], label: Str, key: HsigVerifyKey) -> Int
+    match httpsig.verify(m, None, input, sig, label, key)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+fn input_code(lines: [Str]) -> Int
+    match hsigfields.parse_signature_input(lines)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+fn signature_code(lines: [Str]) -> Int
+    match hsigfields.parse_signature(lines)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+// ── Errors ───────────────────────────────────────────────────────────
+
+@test
+fn test_every_error_code_has_its_own_sentence()
+    test.case("codes 1 to 28")
+    var seen: [Str] = []
+    for code in 1..29
+        let m = hsigtypes.code_message(code)
+        test.assert_true(m != "unknown error", "code " + str.from_int(code))
+        test.assert_true(not list.contains(seen, m), "duplicate sentence for " + str.from_int(code))
+        list.push(seen, m)
+    test.assert(hsigtypes.code_message(0) == "unknown error")
+
+    test.case("the Error impl adds the detail when there is one")
+    test.assert(hsigtypes.error(HSIG_ERR_MISSING_FIELD, "date").message() == "covered field is not in the message: date")
+    test.assert(hsigtypes.error(HSIG_ERR_MISSING_FIELD, "").message() == "covered field is not in the message")
+
+// ── The three fields ─────────────────────────────────────────────────
+
+@test
+fn test_signature_input_is_a_dictionary_of_inner_lists_of_strings()
+    test.case("two labels, components with parameters, parameters in order")
+    match hsigfields.parse_signature_input(["sig1=(\"@method\" \"example-dict\";key=\"a\");created=1;keyid=\"k\", sig2=();nonce=\"n\""])
+        Err(_) => test.fail("parsed")
+        Ok(es) =>
+            test.assert(list.len(es) == 2)
+            test.assert(es[0].label == "sig1")
+            test.assert(list.len(es[0].components) == 2)
+            test.assert(es[0].components[1].name == "example-dict")
+            test.assert(sfvtypes.param_get(es[0].components[1].params, "key") == Some(SfvString("a")))
+            test.assert(es[0].params[0].key == "created" and es[0].params[1].key == "keyid")
+            test.assert(list.len(es[1].components) == 0)
+            test.assert(hsigfields.nonce(es[1].params) == Some("n"))
+
+    test.case("the lines of one field are joined")
+    match hsigfields.parse_signature_input(["a=(\"x\");created=1", "b=(\"y\");created=2"])
+        Err(_) => test.fail("parsed")
+        Ok(es) => test.assert(list.len(es) == 2)
+
+    test.case("an empty field has no entries")
+    match hsigfields.parse_signature_input([])
+        Err(_) => test.fail("parsed")
+        Ok(es) => test.assert(list.len(es) == 0)
+
+@test
+fn test_signature_input_that_is_not_that_shape_is_refused()
+    test.case("not a Dictionary")
+    test.assert(input_code(["(((("]) == HSIG_ERR_BAD_FIELD)
+    test.case("a member that is an Item, not an Inner List")
+    test.assert(input_code(["sig1=5"]) == HSIG_ERR_BAD_FIELD)
+    test.assert(input_code(["sig1"]) == HSIG_ERR_BAD_FIELD)
+    test.case("a component that is not a String")
+    test.assert(input_code(["sig1=(\"a\" b)"]) == HSIG_ERR_BAD_FIELD)
+    test.assert(input_code(["sig1=(1)"]) == HSIG_ERR_BAD_FIELD)
+    test.assert(input_code(["sig1=(\"a\")"]) == 0)
+
+@test
+fn test_signature_is_a_dictionary_of_byte_sequences()
+    test.case("two labels")
+    match hsigfields.parse_signature(["a=:aGVsbG8=:, b=:AAEC:"])
+        Err(_) => test.fail("parsed")
+        Ok(es) =>
+            test.assert(list.len(es) == 2)
+            test.assert(es[0].label == "a" and es[0].signature == bytes.from_str("hello"))
+            test.assert(es[1].signature == bytes.from_byte_list([0, 1, 2]))
+            test.assert(hsigfields.find_signature(es, "b") != None)
+            test.assert(hsigfields.find_signature(es, "zz") == None)
+    test.case("what is refused")
+    test.assert(signature_code(["a=5"]) == HSIG_ERR_BAD_FIELD)
+    test.assert(signature_code(["a=\"text\""]) == HSIG_ERR_BAD_FIELD)
+    test.assert(signature_code(["a=(:AAEC:)"]) == HSIG_ERR_BAD_FIELD)
+    test.assert(signature_code(["((("]) == HSIG_ERR_BAD_FIELD)
+
+@test
+fn test_members_are_written_for_the_caller_to_join()
+    test.case("a Signature-Input member and a Signature member")
+    match hsigfields.input_member("sig1",
+        [hsigtypes.component("@method"), hsigtypes.component_key("example-dict", "a")],
+        [sfvtypes.param("created", SfvInteger(5))])
+        Ok(m)  => test.assert(m == "sig1=(\"@method\" \"example-dict\";key=\"a\");created=5")
+        Err(_) => test.fail("written")
+    test.assert(hsigfields.signature_member("sig1", bytes.from_str("hello")) == Ok("sig1=:aGVsbG8=:"))
+    test.assert(hsigfields.join_members(["a=1", "b=2"]) == "a=1, b=2")
+    test.assert(hsigfields.join_members([]) == "")
+
+    test.case("a label that is not a key is refused")
+    match hsigfields.input_member("Sig 1", [], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_BAD_FIELD)
+    match hsigfields.signature_member("", bytes.zeros(1))
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_BAD_FIELD)
+
+    test.case("components or parameters that cannot be written")
+    match hsigfields.input_member("sig1", [hsigtypes.component_with("a", [sfvtypes.param("K", SfvBoolean(true))])], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_UNSERIALISABLE)
+
+    test.case("the output reads back")
+    match hsigfields.input_member("s", [hsigtypes.component("a")], [sfvtypes.param("tag", SfvString("t"))])
+        Err(_) => test.fail("written")
+        Ok(m)  =>
+            match hsigfields.parse_signature_input([m])
+                Err(_) => test.fail("read")
+                Ok(es) =>
+                    test.assert(hsigfields.tag(es[0].params) == Some("t"))
+                    test.assert(hsigfields.find_input(es, "s") != None)
+                    test.assert(hsigfields.find_input(es, "q") == None)
+
+@test
+fn test_the_typed_parameters_are_read_by_name_and_type()
+    let ps = [sfvtypes.param("created", SfvInteger(1)),
+        sfvtypes.param("expires", SfvInteger(2)),
+        sfvtypes.param("nonce", SfvString("n")),
+        sfvtypes.param("alg", SfvString("ed25519")),
+        sfvtypes.param("keyid", SfvString("k")),
+        sfvtypes.param("tag", SfvString("t"))]
+    test.assert(hsigfields.created(ps) == Some(1))
+    test.assert(hsigfields.expires(ps) == Some(2))
+    test.assert(hsigfields.nonce(ps) == Some("n"))
+    test.assert(hsigfields.alg(ps) == Some("ed25519"))
+    test.assert(hsigfields.keyid(ps) == Some("k"))
+    test.assert(hsigfields.tag(ps) == Some("t"))
+    test.case("absent, or of another type")
+    let none: [SfvParam] = []
+    test.assert(hsigfields.created(none) == None and hsigfields.expires(none) == None)
+    test.assert(hsigfields.nonce(none) == None and hsigfields.alg(none) == None)
+    test.assert(hsigfields.keyid(none) == None and hsigfields.tag(none) == None)
+    let wrong = [sfvtypes.param("created", SfvString("1")),
+        sfvtypes.param("expires", SfvBoolean(true)),
+        sfvtypes.param("nonce", SfvInteger(1)),
+        sfvtypes.param("alg", SfvToken("ed25519")),
+        sfvtypes.param("keyid", SfvInteger(1)),
+        sfvtypes.param("tag", SfvInteger(1))]
+    test.assert(hsigfields.created(wrong) == None and hsigfields.expires(wrong) == None)
+    test.assert(hsigfields.nonce(wrong) == None and hsigfields.alg(wrong) == None)
+    test.assert(hsigfields.keyid(wrong) == None and hsigfields.tag(wrong) == None)
+
+// ── Accept-Signature ─────────────────────────────────────────────────
+
+@test
+fn test_accept_signature_asks_and_the_answer_fulfils_the_request()
+    test.case("section 5.1: the example field")
+    match hsigfields.parse_accept_signature(["sig1=(\"@method\" \"@target-uri\" \"@authority\" \"content-digest\" \"cache-control\");keyid=\"test-key-rsa-pss\";created;tag=\"app-123\""])
+        Err(_) => test.fail("parsed")
+        Ok(es) =>
+            test.assert(list.len(es) == 1)
+            test.assert(list.len(es[0].components) == 5)
+            test.assert(hsigfields.keyid(es[0].params) == Some("test-key-rsa-pss"))
+            test.assert(sfvtypes.param_get(es[0].params, "created") == Some(SfvBoolean(true)))
+
+            test.case("section 5.2: created takes the time, the others are copied, the order is kept")
+            let ps = hsigfields.fulfil_params(es[0], 1618884473, 1618884773)
+            test.assert(ps[0].key == "keyid" and ps[1].key == "created" and ps[2].key == "tag")
+            test.assert(hsigfields.created(ps) == Some(1618884473))
+            test.assert(hsigfields.tag(ps) == Some("app-123"))
+            test.assert(hsigfields.expires(ps) == None)
+
+            test.case("the signature made from it has the same label and components")
+            match httpsig.sign(msg(), None, es[0].label, es[0].components, ps, HsigHmacKey(secret()))
+                Err(e) => test.assert_true(e.code == HSIG_ERR_MISSING_FIELD, e.message())
+                Ok(_)  => test.fail("signed a field the message does not have")
+
+    test.case("expires is fulfilled too")
+    match hsigfields.parse_accept_signature(["s=(\"date\");expires;nonce=\"x\""])
+        Err(_) => test.fail("parsed")
+        Ok(es) =>
+            let ps = hsigfields.fulfil_params(es[0], 10, 20)
+            test.assert(hsigfields.expires(ps) == Some(20))
+            test.assert(hsigfields.nonce(ps) == Some("x"))
+            match httpsig.sign(msg(), None, es[0].label, es[0].components, ps, HsigHmacKey(secret()))
+                Err(_) => test.fail("signing")
+                Ok(s)  => test.assert(s.signature_input == "s=(\"date\");expires=20;nonce=\"x\"")
+
+// ── Algorithms ───────────────────────────────────────────────────────
+
+@test
+fn test_hmac_signs_deterministically_and_compares_whole()
+    test.case("the same base and secret give the same 32 bytes")
+    match hsigalg.sign("base", HsigHmacKey(secret()))
+        Err(_) => test.fail("signed")
+        Ok(a)  =>
+            test.assert(bytes.len(a) == 32)
+            test.assert(hsigalg.sign("base", HsigHmacKey(secret())) == Ok(a))
+            test.assert(hsigalg.verify("base", a, HsigHmacVerifyKey(secret())) == Ok(true))
+            test.assert(hsigalg.verify("basf", a, HsigHmacVerifyKey(secret())) == Ok(false))
+            test.assert(hsigalg.verify("base", bytes.slice(a, 0, 31), HsigHmacVerifyKey(secret())) == Ok(false))
+            test.assert(hsigalg.verify("base", bytes.zeros(0), HsigHmacVerifyKey(secret())) == Ok(false))
+            test.assert(hsigalg.verify("base", a, HsigHmacVerifyKey(bytes.from_str("other"))) == Ok(false))
+
+@test
+fn test_ed25519_and_ecdsa_round_trip_and_refuse_bad_material()
+    let seed = bytes.from_byte_list([1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32])
+    test.case("Ed25519: a signature is 64 bytes and verifies under the public key of the seed")
+    match hsigalg.sign("base", HsigEd25519Key(seed))
+        Err(_)  => test.fail("signed")
+        Ok(sig) =>
+            test.assert(bytes.len(sig) == 64)
+            test.assert(hsigalg.sign("base", HsigEd25519Key(seed)) == Ok(sig))
+            test.assert(hsigalg.verify("base", sig, HsigEd25519VerifyKey(bytes.zeros(32))) != Ok(true))
+            test.assert(hsigalg.verify("base", bytes.slice(sig, 0, 63), HsigEd25519VerifyKey(bytes.zeros(32))) == Ok(false))
+    test.case("Ed25519: a seed or a public key of the wrong length is a bad key")
+    test.assert(hsigalg.sign("base", HsigEd25519Key(bytes.zeros(5))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "ed25519")))
+    test.assert(hsigalg.verify("base", bytes.zeros(64), HsigEd25519VerifyKey(bytes.zeros(5))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "ed25519")))
+
+    test.case("ECDSA: a scalar of 1 to n-1 signs, and verifies under its public point")
+    let d = bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7])
+    match hsigalg.sign("base", HsigEcdsaP256Key(d))
+        Err(_)  => test.fail("signed")
+        Ok(sig) =>
+            test.assert(bytes.len(sig) == 64)
+            test.assert(hsigalg.verify("base",
+                bytes.slice(sig, 0, 63),
+                HsigEcdsaP256VerifyKey(bytes.zeros(32), bytes.zeros(32))) == Ok(false))
+    test.case("ECDSA: a scalar of zero or of the wrong length is a bad key, and so is a point off the curve")
+    test.assert(hsigalg.sign("base", HsigEcdsaP256Key(bytes.zeros(32))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "ecdsa-p256-sha256")))
+    test.assert(hsigalg.sign("base", HsigEcdsaP256Key(bytes.zeros(3))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "ecdsa-p256-sha256")))
+    test.assert(hsigalg.verify("base", bytes.zeros(64), HsigEcdsaP256VerifyKey(bytes.zeros(32), bytes.zeros(32))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "ecdsa-p256-sha256")))
+    test.assert(hsigalg.verify("base", bytes.zeros(64), HsigEcdsaP256VerifyKey(bytes.zeros(3), bytes.zeros(3))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "ecdsa-p256-sha256")))
+
+@test
+fn test_rsa_keys_are_checked_before_they_are_used()
+    test.case("a modulus that is too short")
+    test.assert(hsigalg.verify("base",
+        bytes.zeros(256),
+        HsigRsaV15VerifyKey(bytes.from_byte_list([1, 0, 1]), bytes.from_byte_list([1, 0, 1]))) == Err(hsigtypes.error(HSIG_ERR_BAD_KEY, "rsa-v1_5-sha256")))
+
+@test
+fn test_each_key_names_its_algorithm()
+    test.assert(hsigalg.alg_of_key(HsigHmacKey(secret())) == ALG_HMAC_SHA256)
+    test.assert(hsigalg.alg_of_key(HsigEd25519Key(secret())) == ALG_ED25519)
+    test.assert(hsigalg.alg_of_key(HsigEcdsaP256Key(secret())) == ALG_ECDSA_P256_SHA256)
+    test.assert(hsigalg.alg_of_verify_key(HsigHmacVerifyKey(secret())) == "hmac-sha256")
+    test.assert(hsigalg.alg_of_verify_key(HsigEd25519VerifyKey(secret())) == "ed25519")
+    test.assert(hsigalg.alg_of_verify_key(HsigEcdsaP256VerifyKey(secret(), secret())) == "ecdsa-p256-sha256")
+    test.assert(hsigalg.alg_of_verify_key(HsigRsaV15VerifyKey(secret(), secret())) == "rsa-v1_5-sha256")
+
+// ── Signing and verifying ────────────────────────────────────────────
+
+@test
+fn test_sign_then_verify_through_the_fields()
+    let key = HsigHmacKey(secret())
+    let vkey = HsigHmacVerifyKey(secret())
+    let ps = [sfvtypes.param("created", SfvInteger(1000)),
+        sfvtypes.param("keyid", SfvString("k1")),
+        sfvtypes.param("alg", SfvString("hmac-sha256")),
+        sfvtypes.param("tag", SfvString("t")),
+        sfvtypes.param("nonce", SfvString("n")),
+        sfvtypes.param("expires", SfvInteger(2000))]
+    match httpsig.sign(msg(), None, "sig-a", comps(), ps, key)
+        Err(_) => test.fail("signed")
+        Ok(s)  =>
+            test.case("the members read back and verify")
+            match httpsig.verify(msg(), None, [s.signature_input], [s.signature], "sig-a", vkey)
+                Err(_) => test.fail("verify")
+                Ok(v)  =>
+                    test.assert(v.label == "sig-a")
+                    test.assert(v.created == Some(1000) and v.expires == Some(2000))
+                    test.assert(v.keyid == Some("k1") and v.alg == Some("hmac-sha256"))
+                    test.assert(v.tag == Some("t") and v.nonce == Some("n"))
+                    test.assert(list.len(v.components) == 3)
+
+            test.case("a second signature in the same fields is found by label")
+            match httpsig.sign(msg(), None, "sig-b", [hsigtypes.component("@path")], created(5), key)
+                Err(_) => test.fail("signed")
+                Ok(t)  =>
+                    let inputs = [hsigfields.join_members([s.signature_input, t.signature_input])]
+                    let sigs = [hsigfields.join_members([s.signature, t.signature])]
+                    test.assert(verify_code(msg(), inputs, sigs, "sig-a", vkey) == 0)
+                    test.assert(verify_code(msg(), inputs, sigs, "sig-b", vkey) == 0)
+                    test.assert(verify_code(msg(), inputs, sigs, "sig-c", vkey) == HSIG_ERR_NO_SIGNATURE_INPUT)
+
+            test.case("a label in Signature-Input and not in Signature, and the reverse")
+            test.assert(verify_code(msg(), [s.signature_input], [], "sig-a", vkey) == HSIG_ERR_NO_SIGNATURE)
+            test.assert(verify_code(msg(), [], [s.signature], "sig-a", vkey) == HSIG_ERR_NO_SIGNATURE_INPUT)
+
+            test.case("a message that changed no longer verifies")
+            let other = hsigtypes.with_trailers(msg(), [])
+            test.assert(verify_code(other, [s.signature_input], [s.signature], "sig-a", vkey) == 0)
+            match hsigmsg.request("GET",
+                "https://example.com/foo?param=Value",
+                [f("Host", "example.com"), f("Date", "Tue, 20 Apr 2021 02:07:55 GMT")])
+                Err(_)      => test.fail("request")
+                Ok(changed) => test.assert(verify_code(changed, [s.signature_input], [s.signature], "sig-a", vkey) == HSIG_ERR_VERIFY_FAILED)
+
+            test.case("a message that lacks a covered field cannot be verified")
+            match hsigmsg.request("POST", "https://example.com/foo", [f("Host", "example.com")])
+                Err(_)      => test.fail("request")
+                Ok(no_date) => test.assert(verify_code(no_date, [s.signature_input], [s.signature], "sig-a", vkey) == HSIG_ERR_MISSING_FIELD)
+
+            test.case("a key of another algorithm, when the signature names none, is a mismatch only if alg is present")
+            test.assert(verify_code(msg(), [s.signature_input], [s.signature], "sig-a", HsigHmacVerifyKey(secret())) == 0)
+            test.assert(verify_code(msg(),
+                [s.signature_input],
+                [s.signature],
+                "sig-a",
+                HsigEd25519VerifyKey(bytes.zeros(3))) == HSIG_ERR_ALG_MISMATCH)
+
+            test.case("malformed fields")
+            test.assert(verify_code(msg(), ["((("], [s.signature], "sig-a", vkey) == HSIG_ERR_BAD_FIELD)
+            test.assert(verify_code(msg(), [s.signature_input], ["((("], "sig-a", vkey) == HSIG_ERR_BAD_FIELD)
+
+@test
+fn test_a_bad_key_is_reported_as_one_when_the_signature_names_no_algorithm()
+    match httpsig.sign(msg(), None, "s", comps(), created(1), HsigHmacKey(secret()))
+        Err(_) => test.fail("signed")
+        Ok(s)  => test.assert(verify_code(msg(), [s.signature_input], [s.signature], "s", HsigEd25519VerifyKey(bytes.zeros(3))) == HSIG_ERR_BAD_KEY)
+
+@test
+fn test_the_alg_parameter_is_checked_against_the_key_and_never_obeyed()
+    test.case("signing with an alg that is not the key's")
+    let wrong = [sfvtypes.param("alg", SfvString("ed25519"))]
+    test.assert(sign_code(msg(), "s", comps(), wrong, HsigHmacKey(secret())) == HSIG_ERR_ALG_MISMATCH)
+
+    test.case("verifying with a key of another algorithm")
+    let named = [sfvtypes.param("alg", SfvString("hmac-sha256"))]
+    match httpsig.sign(msg(), None, "s", comps(), named, HsigHmacKey(secret()))
+        Err(_) => test.fail("signed")
+        Ok(s)  =>
+            test.assert(verify_code(msg(), [s.signature_input], [s.signature], "s", HsigEd25519VerifyKey(bytes.zeros(32))) == HSIG_ERR_ALG_MISMATCH)
+            test.assert(verify_code(msg(), [s.signature_input], [s.signature], "s", HsigHmacVerifyKey(secret())) == 0)
+
+    test.case("a signature with no alg is checked with the key as given")
+    match httpsig.sign(msg(), None, "s", comps(), created(1), HsigHmacKey(secret()))
+        Err(_) => test.fail("signed")
+        Ok(s)  => test.assert(verify_code(msg(), [s.signature_input], [s.signature], "s", HsigHmacVerifyKey(secret())) == 0)
+
+@test
+fn test_signing_refuses_what_cannot_be_signed()
+    let key = HsigHmacKey(secret())
+    test.case("a label that is not a key")
+    test.assert(sign_code(msg(), "Sig One", comps(), [], key) == HSIG_ERR_BAD_FIELD)
+    test.case("a covered field the message lacks")
+    test.assert(sign_code(msg(), "s", [hsigtypes.component("x-absent")], [], key) == HSIG_ERR_MISSING_FIELD)
+    test.case("a bad key")
+    test.assert(sign_code(msg(), "s", comps(), [], HsigEd25519Key(bytes.zeros(3))) == HSIG_ERR_BAD_KEY)
+    test.case("a prepared signature carries the parts for a verifier of another algorithm")
+    match httpsig.sign(msg(), None, "s", comps(), created(7), key)
+        Err(_) => test.fail("signed")
+        Ok(s)  =>
+            match httpsig.prepare(msg(), None, [s.signature_input], [s.signature], "s")
+                Err(_) => test.fail("prepare")
+                Ok(p)  =>
+                    test.assert(p.base == s.base)
+                    test.assert(p.signature == s.value)
+                    test.assert(p.label == "s")
+                    test.assert(hsigfields.created(p.params) == Some(7))
+
+// ── Time and coverage ────────────────────────────────────────────────
+
+@test
+fn test_check_time_allows_a_skew_and_names_which_bound_failed()
+    let ps = [sfvtypes.param("created", SfvInteger(100)), sfvtypes.param("expires", SfvInteger(200))]
+    test.case("inside the window")
+    test.assert(httpsig.check_time(ps, 150, 0) == None)
+    test.assert(httpsig.check_time(ps, 100, 0) == None)
+    test.assert(httpsig.check_time(ps, 200, 0) == None)
+    test.case("after expires")
+    match httpsig.check_time(ps, 201, 0)
+        Some(e) => test.assert(e.code == HSIG_ERR_EXPIRED)
+        None    => test.fail("accepted")
+    test.assert(httpsig.check_time(ps, 205, 5) == None)
+    match httpsig.check_time(ps, 206, 5)
+        Some(e) => test.assert(e.code == HSIG_ERR_EXPIRED)
+        None    => test.fail("accepted")
+    test.case("before created")
+    match httpsig.check_time(ps, 99, 0)
+        Some(e) => test.assert(e.code == HSIG_ERR_FROM_FUTURE)
+        None    => test.fail("accepted")
+    test.assert(httpsig.check_time(ps, 95, 5) == None)
+    test.case("a signature with neither is always acceptable")
+    let none: [SfvParam] = []
+    test.assert(httpsig.check_time(none, 5, 0) == None)
+
+@test
+fn test_check_covered_names_the_first_required_component_that_is_missing()
+    let covered = [hsigtypes.component("@method"),
+        hsigtypes.component_key("example-dict", "a"),
+        hsigtypes.component("date")]
+    test.case("all present")
+    test.assert(httpsig.check_covered(covered, [hsigtypes.component("date"), hsigtypes.component("@method")]) == None)
+    test.assert(httpsig.check_covered(covered, []) == None)
+    test.case("one missing")
+    match httpsig.check_covered(covered, [hsigtypes.component("date"), hsigtypes.component("@authority")])
+        Some(e) =>
+            test.assert(e.code == HSIG_ERR_NOT_COVERED)
+            test.assert(e.detail == "\"@authority\"")
+        None    => test.fail("accepted")
+    test.case("the same name with other parameters is another component")
+    match httpsig.check_covered(covered, [hsigtypes.component_key("example-dict", "b")])
+        Some(e) => test.assert(e.code == HSIG_ERR_NOT_COVERED)
+        None    => test.fail("accepted")
+    test.assert(httpsig.check_covered(covered, [hsigtypes.component_key("example-dict", "a")]) == None)
+    test.case("a required component that cannot be written is an error, and a covered one that cannot be written covers nothing")
+    match httpsig.check_covered(covered, [hsigtypes.component_with("a", [sfvtypes.param("K", SfvBoolean(true))])])
+        Some(e) => test.assert(e.code == HSIG_ERR_UNSERIALISABLE)
+        None    => test.fail("accepted")
+    match httpsig.check_covered([hsigtypes.component_with("a", [sfvtypes.param("K", SfvBoolean(true))])],
+        [hsigtypes.component("a")])
+        Some(e) => test.assert(e.code == HSIG_ERR_NOT_COVERED)
+        None    => test.fail("accepted")
+
+@test
+fn test_verify_prepared_checks_a_prepared_signature_with_a_key()
+    let key = HsigHmacKey(secret())
+    match httpsig.sign(msg(), None, "s", comps(), created(7), key)
+        Err(_) => test.fail("signed")
+        Ok(s)  =>
+            match httpsig.prepare(msg(), None, [s.signature_input], [s.signature], "s")
+                Err(_) => test.fail("prepare")
+                Ok(p)  =>
+                    test.case("the right key verifies and reports the signature's own parameters")
+                    match httpsig.verify_prepared(p, HsigHmacVerifyKey(secret()))
+                        Ok(v)  => test.assert(v.created == Some(7))
+                        Err(_) => test.fail("verify")
+                    test.case("another secret does not")
+                    match httpsig.verify_prepared(p, HsigHmacVerifyKey(bytes.from_str("other")))
+                        Ok(_)  => test.fail("verified")
+                        Err(e) => test.assert(e.code == HSIG_ERR_VERIFY_FAILED)

@@ -1,0 +1,334 @@
+// hsigbase.nv — the signature base, RFC 9421 section 2.5.
+//
+// A signature covers a string, the signature base: one line for each
+// covered component, `"name";params: value`, and a last line,
+// `"@signature-params": (...)`, that holds the list of covered components and
+// the signature's own parameters.  Whoever signs and whoever verifies both
+// build it from the message, and the signature is over its bytes, so every
+// byte matters.
+//
+// `component_value` is the value of one component (sections 2.1 and 2.2),
+// `signature_params_value` is the last line's value (section 2.3), and
+// `signature_base` is the whole (section 2.5).  Each answers an
+// `HsigError` where the RFC says to produce an error, and none produces a
+// base from a component it cannot resolve.
+//
+// A VALUE IS CHECKED FOR LINE BREAKS.  A line break inside a component value
+// would let one component look like two lines of the base.  A value that
+// holds a CR or an LF after the folding of section 2.1 is refused.
+
+use std.bytes
+use std.list
+use std.str
+use hsigmsg
+use hsigtypes
+use sfvparse
+use sfvtypes
+use sfvwrite
+
+// Whether a component carries a flag parameter, set to true.
+fn has_flag(params: [SfvParam], name: Str) -> Bool []
+    match sfvtypes.param_get(params, name)
+        Some(SfvBoolean(b)) => b
+        _                   => false
+
+// The String parameter of a component, or `None`.
+fn string_param(params: [SfvParam], name: Str) -> ?Str []
+    match sfvtypes.param_get(params, name)
+        Some(SfvString(s)) => Some(s)
+        _                  => None
+
+// Whether `name` is a flag parameter this package understands.
+fn is_flag_name(name: Str) -> Bool []
+    name == "sf" or name == "bs" or name == "req" or name == "tr"
+
+// The first parameter of a component that is unknown, or has the wrong type
+// of value (a flag must be `?1`, `key` and `name` must be Strings).
+fn bad_parameter(params: [SfvParam]) -> ?Str []
+    for p in params
+        if is_flag_name(p.key)
+            if not has_flag([p], p.key)
+                return Some(p.key)
+        else if p.key == "key" or p.key == "name"
+            match p.value
+                SfvString(_) => ()
+                _            =>
+                    return Some(p.key)
+        else
+            return Some(p.key)
+    None
+
+// A bad-parameter error for a component.
+fn bad_param_error(c: HsigComponent, which: Str) -> HsigError []
+    hsigtypes.error(HSIG_ERR_BAD_PARAMETER, c.name + ";" + which)
+
+// The value of a derived component in the context message `ctx`.
+fn derived_value(ctx: HsigMessage, c: HsigComponent) -> Result<Str, HsigError> []
+    // Only `req` applies to a derived component, and `name` to `@query-param`.
+    for p in c.params
+        if p.key != "req" and not (p.key == "name" and c.name == "@query-param")
+            return Err(bad_param_error(c, p.key))
+    if c.name == "@status"
+        if ctx.kind != HSIG_RESPONSE
+            return Err(hsigtypes.error(HSIG_ERR_WRONG_MESSAGE, c.name))
+        return Ok(str.from_int(ctx.status))
+    let known = c.name == "@method" or c.name == "@target-uri" or c.name == "@authority" or c.name == "@scheme" or c.name == "@request-target" or c.name == "@path" or c.name == "@query" or c.name == "@query-param"
+    if not known
+        return Err(hsigtypes.error(HSIG_ERR_UNKNOWN_COMPONENT, c.name))
+    if ctx.kind != HSIG_REQUEST
+        return Err(hsigtypes.error(HSIG_ERR_WRONG_MESSAGE, c.name))
+    if c.name == "@method"
+        return Ok(ctx.method)
+    if c.name == "@target-uri"
+        return Ok(hsigmsg.target_uri_value(ctx))
+    if c.name == "@authority"
+        return Ok(hsigmsg.authority_value(ctx))
+    if c.name == "@scheme"
+        return Ok(ctx.scheme)
+    if c.name == "@request-target"
+        return Ok(hsigmsg.request_target_value(ctx))
+    if c.name == "@path"
+        return Ok(hsigmsg.path_value(ctx))
+    if c.name == "@query"
+        return Ok(hsigmsg.query_value(ctx))
+    match string_param(c.params, "name")
+        None    => Err(bad_param_error(c, "name"))
+        Some(n) => hsigmsg.query_param_value(ctx.query, n)
+
+// The text of a serialisation, for a value that was just parsed.
+//
+// A value that sfv-nv parsed is within every bound its writer checks, so the
+// writer cannot refuse it, and a refusal here answers the empty string.
+fn text_of(r: Result<Str, SfvError>) -> Str []
+    match r
+        Ok(t)  => t
+        // cov: skip — a parsed value is always within the bounds the writer checks
+        Err(_) => ""
+
+// A member of a Dictionary written as its own value: an Item, or an Inner
+// List, with its parameters.
+fn member_text(m: SfvMember) -> Str []
+    match m
+        SfvMemberItem(it) => text_of(sfvwrite.serialize_item(it))
+        SfvMemberInner(_) => text_of(sfvwrite.serialize_list([m]))
+
+// The error for a field value that does not parse as its type.
+fn bad_value(name: Str) -> HsigError []
+    hsigtypes.error(HSIG_ERR_BAD_FIELD_VALUE, name)
+
+// The value of the member `member` of the Dictionary in `combined`.
+fn dictionary_member(name: Str, combined: Str, member: Str) -> Result<Str, HsigError> []
+    match sfvparse.parse_dictionary(combined)
+        Err(_)      => Err(bad_value(name))
+        Ok(entries) =>
+            match sfvtypes.dict_get(entries, member)
+                None    => Err(hsigtypes.error(HSIG_ERR_MISSING_MEMBER, name + ";key=" + member))
+                Some(m) => Ok(member_text(m))
+
+// The value of a field written strictly as the Structured Field type it is
+// (section 2.1.1).
+fn strict_value(name: Str, kind: Int, combined: Str) -> Result<Str, HsigError> []
+    if kind == HSIG_SF_DICT
+        match sfvparse.parse_dictionary(combined)
+            Err(_)      =>
+                return Err(bad_value(name))
+            Ok(entries) =>
+                return Ok(text_of(sfvwrite.serialize_dictionary(entries)))
+    if kind == HSIG_SF_LIST
+        match sfvparse.parse_list(combined)
+            Err(_)      =>
+                return Err(bad_value(name))
+            Ok(members) =>
+                return Ok(text_of(sfvwrite.serialize_list(members)))
+    match sfvparse.parse_item(combined)
+        Err(_) => Err(bad_value(name))
+        Ok(it) => Ok(text_of(sfvwrite.serialize_item(it)))
+
+// The bytes of a string.
+fn bytes_of(s: Str) -> Bytes []
+    bytes.from_str(s)
+
+// The value of a field written with each line a Byte Sequence (section
+// 2.1.3).
+fn wrapped_value(lines: [Str]) -> Str []
+    var members: [SfvMember] = []
+    for line in lines
+        list.push(members, sfvtypes.member(SfvBinary(bytes_of(line))))
+    text_of(sfvwrite.serialize_list(members))
+
+// The value of a field component in the context message `ctx`.
+fn field_value(ctx: HsigMessage, c: HsigComponent) -> Result<Str, HsigError> []
+    for p in c.params
+        if p.key == "name"
+            return Err(bad_param_error(c, p.key))
+    let sf = has_flag(c.params, "sf")
+    let bs = has_flag(c.params, "bs")
+    let tr = has_flag(c.params, "tr")
+    let key = string_param(c.params, "key")
+    if bs and (sf or key != None)
+        return Err(hsigtypes.error(HSIG_ERR_INCOMPATIBLE, c.name))
+    let lines = hsigmsg.message_lines(ctx, tr, c.name)
+    if list.len(lines) == 0
+        return Err(hsigtypes.error(HSIG_ERR_MISSING_FIELD, c.name))
+    if bs
+        return Ok(wrapped_value(lines))
+    let combined = str.join(lines, ", ")
+    match key
+        Some(member) =>
+            if hsigtypes.field_type(ctx, c.name) != HSIG_SF_DICT
+                return Err(hsigtypes.error(HSIG_ERR_UNKNOWN_FIELD_TYPE, c.name))
+            return dictionary_member(c.name, combined, member)
+        None         => ()
+    if sf
+        let kind = hsigtypes.field_type(ctx, c.name)
+        if kind == 0
+            return Err(hsigtypes.error(HSIG_ERR_UNKNOWN_FIELD_TYPE, c.name))
+        return strict_value(c.name, kind, combined)
+    Ok(combined)
+
+// The value of one covered component.
+//
+// `msg` is the message being signed or verified, and `req` is the request
+// that a response answers, for a component with the `req` parameter (section
+// 2.4).  The answer is the component value of sections 2.1 and 2.2, or an
+// error where section 2.5 says the algorithm fails: a field that is not in
+// the message, a name that is not in lower case, a parameter that is unknown
+// or does not apply, `bs` with `sf` or `key`, `req` on a request, a
+// dictionary member or query parameter that is absent.
+//
+// ```novo
+// use hsigbase
+// use hsigmsg
+// use hsigtypes
+//
+// fn main() [io]
+//     match hsigmsg.request("POST", "https://example.com/foo?param=Value&Pet=dog", [hsigtypes.field("Host", "example.com")])
+//         Err(e) => println(e.message())
+//         Ok(m) =>
+//             match hsigbase.component_value(m, None, hsigtypes.component("@path"))
+//                 Ok(v) => println(v)   // /foo
+//                 Err(e) => println(e.message())
+// ```
+pub fn component_value(msg: HsigMessage, req: ?HsigMessage,
+                       c: HsigComponent) -> Result<Str, HsigError> []
+    if c.name == "" or c.name != str.lower(c.name)
+        return Err(hsigtypes.error(HSIG_ERR_BAD_NAME, c.name))
+    match bad_parameter(c.params)
+        Some(p) =>
+            return Err(bad_param_error(c, p))
+        None    => ()
+    var ctx = msg
+    if has_flag(c.params, "req")
+        if msg.kind == HSIG_REQUEST
+            return Err(hsigtypes.error(HSIG_ERR_REQ_ON_REQUEST, c.name))
+        match req
+            None    =>
+                return Err(hsigtypes.error(HSIG_ERR_NO_REQUEST, c.name))
+            Some(r) =>
+                ctx = r
+    if str.starts_with(c.name, "@")
+        return derived_value(ctx, c)
+    field_value(ctx, c)
+
+// The value of the `@signature-params` line: the covered components as an
+// Inner List of Strings with their parameters, then the signature
+// parameters, in the order given (section 2.3).
+//
+// This is also what follows the label in a `Signature-Input` field.
+//
+// ```novo
+// use hsigbase
+// use hsigtypes
+// use sfvtypes
+//
+// fn main() [io]
+//     let comps = [hsigtypes.component("@method"), hsigtypes.component("@authority")]
+//     match hsigbase.signature_params_value(comps, [sfvtypes.param("created", SfvInteger(1618884473))])
+//         Ok(v) => println(v)   // ("@method" "@authority");created=1618884473
+//         Err(e) => println(e.message())
+// ```
+pub fn signature_params_value(components: [HsigComponent],
+                              params: [SfvParam]) -> Result<Str, HsigError> []
+    var items: [SfvItem] = []
+    for c in components
+        list.push(items, hsigtypes.component_item(c))
+    let inner = sfvtypes.inner(items, params)
+    match sfvwrite.serialize_list([SfvMemberInner(inner)])
+        Ok(t)  => Ok(t)
+        Err(_) => Err(hsigtypes.error(HSIG_ERR_UNSERIALISABLE, "signature parameters"))
+
+// Whether a string holds a CR or an LF.
+fn has_break(s: Str) -> Bool []
+    str.contains(s, "\r") or str.contains(s, "\n")
+
+// Whether every byte of a string is ASCII.
+fn is_ascii(s: Str) -> Bool []
+    for i in 0..str.len(s)
+        if str.byte_at_or(s, i, 0) > 127
+            return false
+    true
+
+// The identifier of a covered component as a base line writes it: the name
+// as a String in quotes and the parameters, `"example-dict";key="a"`.
+//
+// ```novo
+// use hsigbase
+// use hsigtypes
+//
+// fn main() [io]
+//     match hsigbase.identifier(hsigtypes.component_key("example-dict", "a"))
+//         Ok(id) => println(id)   // "example-dict";key="a"
+//         Err(e) => println(e.message())
+// ```
+pub fn identifier(c: HsigComponent) -> Result<Str, HsigError> []
+    match sfvwrite.serialize_item(hsigtypes.component_item(c))
+        Ok(t)  => Ok(t)
+        Err(_) => Err(hsigtypes.error(HSIG_ERR_UNSERIALISABLE, c.name))
+
+// The signature base for a message (section 2.5).
+//
+// `components` is the ordered list of covered components, `params` the
+// ordered signature parameters.  The base ends with the
+// `@signature-params` line and no line feed after it.
+//
+// ```novo
+// use hsigbase
+// use hsigmsg
+// use hsigtypes
+//
+// fn main() [io]
+//     match hsigmsg.request("GET", "https://example.com/x", [])
+//         Err(e) => println(e.message())
+//         Ok(m) =>
+//             match hsigbase.signature_base(m, None, [hsigtypes.component("@method")], [])
+//                 Ok(b) => println(b)
+//                 Err(e) => println(e.message())
+// ```
+pub fn signature_base(msg: HsigMessage, req: ?HsigMessage, components: [HsigComponent],
+                      params: [SfvParam]) -> Result<Str, HsigError> []
+    var out = ""
+    var seen: [Str] = []
+    for c in components
+        if c.name == "@signature-params"
+            return Err(hsigtypes.error(HSIG_ERR_SIGNATURE_PARAMS_COMPONENT, c.name))
+        match identifier(c)
+            Err(e) =>
+                return Err(e)
+            Ok(id) =>
+                if list.contains(seen, id)
+                    return Err(hsigtypes.error(HSIG_ERR_DUPLICATE_COMPONENT, id))
+                list.push(seen, id)
+                match component_value(msg, req, c)
+                    Err(e) =>
+                        return Err(e)
+                    Ok(v)  =>
+                        if has_break(v)
+                            return Err(hsigtypes.error(HSIG_ERR_BAD_FIELD_VALUE, c.name))
+                        out = out + id + ": " + v + "\n"
+    match signature_params_value(components, params)
+        Err(e) => Err(e)
+        Ok(pv) =>
+            let base = out + "\"@signature-params\": " + pv
+            if not is_ascii(base)
+                return Err(hsigtypes.error(HSIG_ERR_NOT_ASCII, ""))
+            Ok(base)

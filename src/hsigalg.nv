@@ -1,0 +1,190 @@
+// hsigalg.nv — the signature algorithms of RFC 9421 section 3.3.
+//
+// An algorithm takes the signature base, as bytes, and a key.  Four of the
+// RFC's algorithms are served by the packages this one depends on.
+//
+//   alg                 signs   verifies   from
+//   hmac-sha256         yes     yes        crypto-nv
+//   ed25519             yes     yes        ed25519-nv
+//   ecdsa-p256-sha256   yes     yes        p256-nv
+//   rsa-v1_5-sha256     no      yes        rsa-nv
+//
+// NOT IMPLEMENTED: `rsa-pss-sha512`, because rsa-nv hashes with SHA-256 and
+// SHA-384 only; `ecdsa-p384-sha384`, because p256-nv has one curve; signing
+// with `rsa-v1_5-sha256`, because rsa-nv does not sign; and the JWS
+// algorithms of section 3.3.7.  A caller with one of those verifies the
+// `signature` of `httpsig.prepare` with its own primitive.
+//
+// A KEY CARRIES ITS ALGORITHM.  The key types below are one variant per
+// algorithm, so a verifier chooses the algorithm by choosing the key and the
+// `alg` parameter of a signature is checked against it, never obeyed
+// (section 3.2, step 6).  A signature that names `hmac-sha256` cannot be
+// checked with an RSA key as though it were an HMAC secret.
+//
+// WHAT A KEY HOLDS.
+//   HMAC      the shared secret, any length.
+//   Ed25519   the 32-byte seed to sign with, the 32-byte public key to verify.
+//   P-256     the 32-byte big-endian private scalar to sign with, the two
+//             32-byte big-endian coordinates to verify.
+//   RSA       the modulus and the public exponent, big-endian.
+//
+// A signature is the bytes the algorithm gives: the 32-byte MAC, the 64
+// bytes of Ed25519, the 64 bytes `r` and `s` of ECDSA, the modulus-length
+// bytes of RSA.
+
+use std.bytes
+use std.list
+use digest
+use ed25519
+use hashing
+use hsigtypes
+use p256
+use rsa
+
+// The `alg` value of HMAC with SHA-256.
+pub const ALG_HMAC_SHA256 = "hmac-sha256"
+// The `alg` value of Ed25519.
+pub const ALG_ED25519 = "ed25519"
+// The `alg` value of ECDSA over P-256 with SHA-256.
+pub const ALG_ECDSA_P256_SHA256 = "ecdsa-p256-sha256"
+// The `alg` value of RSASSA-PKCS1-v1_5 with SHA-256.
+pub const ALG_RSA_V1_5_SHA256 = "rsa-v1_5-sha256"
+
+// A key to sign with.
+pub enum HsigKey
+    // A shared secret for `hmac-sha256`.
+    HsigHmacKey(secret: Bytes)
+    // A 32-byte seed for `ed25519`.
+    HsigEd25519Key(seed: Bytes)
+    // A 32-byte private scalar for `ecdsa-p256-sha256`.
+    HsigEcdsaP256Key(scalar: Bytes)
+
+// A key to verify with.
+pub enum HsigVerifyKey
+    // A shared secret for `hmac-sha256`.
+    HsigHmacVerifyKey(secret: Bytes)
+    // A 32-byte public key for `ed25519`.
+    HsigEd25519VerifyKey(public_key: Bytes)
+    // The two 32-byte coordinates for `ecdsa-p256-sha256`.
+    HsigEcdsaP256VerifyKey(x: Bytes, y: Bytes)
+    // The modulus and the exponent for `rsa-v1_5-sha256`.
+    HsigRsaV15VerifyKey(modulus: Bytes, exponent: Bytes)
+
+// The algorithm name of a signing key.
+pub fn alg_of_key(key: HsigKey) -> Str []
+    match key
+        HsigHmacKey(_)      => ALG_HMAC_SHA256
+        HsigEd25519Key(_)   => ALG_ED25519
+        HsigEcdsaP256Key(_) => ALG_ECDSA_P256_SHA256
+
+// The algorithm name of a verification key.
+pub fn alg_of_verify_key(key: HsigVerifyKey) -> Str []
+    match key
+        HsigHmacVerifyKey(_)         => ALG_HMAC_SHA256
+        HsigEd25519VerifyKey(_)      => ALG_ED25519
+        HsigEcdsaP256VerifyKey(_, _) => ALG_ECDSA_P256_SHA256
+        HsigRsaV15VerifyKey(_, _)    => ALG_RSA_V1_5_SHA256
+
+// The error for key material that is not a key.
+fn bad_key(alg: Str) -> HsigError []
+    hsigtypes.error(HSIG_ERR_BAD_KEY, alg)
+
+// The SHA-256 digest of a signature base, as a byte list.
+fn base_digest(base: Str) -> [u8] []
+    bytes.to_byte_list(hashing.sha256(bytes.from_str(base)))
+
+// Sign with Ed25519.
+fn sign_ed25519(base: Str, seed: Bytes) -> Result<Bytes, HsigError> []
+    match ed25519.signing_key_from_seed(bytes.to_byte_list(seed))
+        Err(_) => Err(bad_key(ALG_ED25519))
+        Ok(k)  =>
+            let sig = ed25519.sign(k, bytes.to_byte_list(bytes.from_str(base)))
+            Ok(bytes.from_byte_list(ed25519.signature_bytes(sig)))
+
+// Sign with ECDSA over P-256 and SHA-256.
+fn sign_ecdsa(base: Str, scalar: Bytes) -> Result<Bytes, HsigError> []
+    match p256.secret_key_from_bytes(bytes.to_byte_list(scalar))
+        Err(_) => Err(bad_key(ALG_ECDSA_P256_SHA256))
+        Ok(k)  =>
+            match p256.ecdsa_sign(k, base_digest(base))
+                // cov: skip — ecdsa_sign refuses only a digest that is not 32 bytes, and this one is SHA-256's
+                Err(_)  => Err(bad_key(ALG_ECDSA_P256_SHA256))
+                Ok(sig) => Ok(bytes.from_byte_list(sig))
+
+// Sign the signature base `base` with `key`.
+//
+// HMAC and Ed25519 are deterministic, so the same base and key give the same
+// bytes.  The ECDSA of p256-nv derives its nonce by RFC 6979, so it is
+// deterministic too.  Answers an error for a key that is not a key.
+//
+// ```novo
+// use std.bytes
+// use hsigalg
+//
+// fn main() [io]
+//     match hsigalg.sign("hello", HsigHmacKey(bytes.from_str("secret")))
+//         Ok(sig) => println("${bytes.len(sig)}")   // 32
+//         Err(e) => println(e.message())
+// ```
+pub fn sign(base: Str, key: HsigKey) -> Result<Bytes, HsigError> []
+    match key
+        HsigHmacKey(secret)      => Ok(hashing.hmac_sha256(secret, bytes.from_str(base), bytes.zeros(32)))
+        HsigEd25519Key(seed)     => sign_ed25519(base, seed)
+        HsigEcdsaP256Key(scalar) => sign_ecdsa(base, scalar)
+
+// Verify with Ed25519.  The strict rule is used: it accepts every signature
+// the other two rules of ed25519-nv accept, and refuses small-order points.
+fn verify_ed25519(base: Str, sig: Bytes, public_key: Bytes) -> Result<Bool, HsigError> []
+    match ed25519.verifying_key_from_bytes(bytes.to_byte_list(public_key))
+        Err(_) => Err(bad_key(ALG_ED25519))
+        Ok(k)  =>
+            match ed25519.signature_from_bytes(bytes.to_byte_list(sig))
+                Err(_) => Ok(false)
+                Ok(s)  =>
+                    match ed25519.verify(k, bytes.to_byte_list(bytes.from_str(base)), s, EdStrict)
+                        Ok(good) => Ok(good)
+                        Err(_)   => Err(bad_key(ALG_ED25519))
+
+// Verify with ECDSA over P-256 and SHA-256.
+fn verify_ecdsa(base: Str, sig: Bytes, x: Bytes, y: Bytes) -> Result<Bool, HsigError> []
+    match p256.public_key_from_bytes(bytes.to_byte_list(x), bytes.to_byte_list(y))
+        Err(_) => Err(bad_key(ALG_ECDSA_P256_SHA256))
+        Ok(k)  =>
+            if bytes.len(sig) != 64
+                return Ok(false)
+            match p256.ecdsa_verify(k, base_digest(base), bytes.to_byte_list(sig))
+                Ok(good) => Ok(good)
+                Err(_)   => Err(bad_key(ALG_ECDSA_P256_SHA256))
+
+// Verify with RSASSA-PKCS1-v1_5 and SHA-256.
+fn verify_rsa(base: Str, sig: Bytes, modulus: Bytes, exponent: Bytes) -> Result<Bool, HsigError> []
+    match rsa.public_key_from_bytes(modulus, exponent)
+        Err(_) => Err(bad_key(ALG_RSA_V1_5_SHA256))
+        Ok(k)  => Ok(rsa.verify_pkcs1(k, Sha256, bytes.from_str(base), sig))
+
+// Whether `sig` is a valid signature of the signature base `base` under
+// `key`.
+//
+// `Ok(false)` is a signature that does not verify, including one of the
+// wrong length.  `Err` is key material that is not a key.  An HMAC is
+// compared in constant time.
+//
+// ```novo
+// use std.bytes
+// use hsigalg
+//
+// fn main() [io]
+//     let secret = bytes.from_str("secret")
+//     match hsigalg.sign("hello", HsigHmacKey(secret))
+//         Err(e) => println(e.message())
+//         Ok(sig) =>
+//             match hsigalg.verify("hello", sig, HsigHmacVerifyKey(secret))
+//                 Ok(good) => println("${good}")   // true
+//                 Err(e) => println(e.message())
+// ```
+pub fn verify(base: Str, sig: Bytes, key: HsigVerifyKey) -> Result<Bool, HsigError> []
+    match key
+        HsigHmacVerifyKey(secret)    => Ok(digest.ct_eq(hashing.hmac_sha256(secret, bytes.from_str(base), bytes.zeros(32)), sig))
+        HsigEd25519VerifyKey(pk)     => verify_ed25519(base, sig, pk)
+        HsigEcdsaP256VerifyKey(x, y) => verify_ecdsa(base, sig, x, y)
+        HsigRsaV15VerifyKey(n, e)    => verify_rsa(base, sig, n, e)

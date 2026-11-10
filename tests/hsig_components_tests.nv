@@ -1,0 +1,499 @@
+// hsig_components_tests.nv — the covered components of RFC 9421 section 2.
+//
+// The examples are the ones the RFC prints: the field values of section 2.1,
+// the strict serialisation of 2.1.1, Dictionary members of 2.1.2, binary
+// wrapping of 2.1.3, trailers of 2.1.4, every derived component of 2.2, and
+// the query parameters of 2.2.8.  After them come the refusals: each
+// condition under which section 2.5 says the algorithm fails.
+
+use std.list
+use std.str
+use std.test
+use hsigbase
+use hsigmsg
+use hsigtypes
+use sfvtypes
+use sfvwrite
+
+// A request with the given header fields.
+fn req(uri: Str, headers: [HsigField]) -> HsigMessage
+    match hsigmsg.request("GET", uri, headers)
+        Ok(m)  => m
+        Err(_) => hsigtypes.response(0, [])
+
+// The value of a component of a message, or "!" followed by the error code.
+fn value(msg: HsigMessage, c: HsigComponent) -> Str
+    match hsigbase.component_value(msg, None, c)
+        Ok(v)  => v
+        Err(e) => "!" + str.from_int(e.code)
+
+fn f(name: Str, v: Str) -> HsigField
+    hsigtypes.field(name, v)
+
+// ── 2.1 Fields ───────────────────────────────────────────────────────
+
+fn section_2_1_message() -> HsigMessage
+    req("https://www.example.com/path", [f("Host", "www.example.com"),
+        f("Date", "Tue, 20 Apr 2021 02:07:56 GMT"),
+        f("X-OWS-Header", "   Leading and trailing whitespace.   "),
+        f("X-Obs-Fold-Header", "Obsolete\r\n    line folding."),
+        f("Cache-Control", "max-age=60"),
+        f("Cache-Control", "   must-revalidate"),
+        f("Example-Dict", " a=1,    b=2;x=1;y=2,   c=(a   b   c)"),
+        f("X-Empty-Header", "")])
+
+@test
+fn test_field_values_are_cleaned_and_combined_as_section_2_1_prints()
+    let m = section_2_1_message()
+    test.case("a plain field, named in any case")
+    test.assert(value(m, hsigtypes.component("host")) == "www.example.com")
+    test.assert(value(m, hsigtypes.component("date")) == "Tue, 20 Apr 2021 02:07:56 GMT")
+    test.case("white space at both ends goes")
+    test.assert(value(m, hsigtypes.component("x-ows-header")) == "Leading and trailing whitespace.")
+    test.case("obsolete line folding becomes one space")
+    test.assert(value(m, hsigtypes.component("x-obs-fold-header")) == "Obsolete line folding.")
+    test.case("two lines are joined with a comma and a space")
+    test.assert(value(m, hsigtypes.component("cache-control")) == "max-age=60, must-revalidate")
+    test.case("a field is read as it is, with its inner spacing")
+    test.assert(value(m, hsigtypes.component("example-dict")) == "a=1,    b=2;x=1;y=2,   c=(a   b   c)")
+    test.case("an empty field has the empty string as its value")
+    test.assert(value(m, hsigtypes.component("x-empty-header")) == "")
+
+@test
+fn test_cleaning_a_value_handles_each_kind_of_fold_and_blank()
+    test.case("a fold with a bare LF, with tabs, and a line break not followed by white space")
+    test.assert(hsigmsg.clean_value("a\n b") == "a b")
+    test.assert(hsigmsg.clean_value("a\r\n\t\t b") == "a b")
+    test.assert(hsigmsg.clean_value("\t a  b \t") == "a  b")
+    test.assert(hsigmsg.clean_value("a\r\nb") == "a\r\nb")
+    test.assert(hsigmsg.clean_value("a\nb") == "a\nb")
+    test.assert(hsigmsg.clean_value("") == "")
+    test.assert(hsigmsg.clean_value("   ") == "")
+    test.assert(hsigmsg.clean_value("a\rb") == "a\rb")
+
+@test
+fn test_a_value_with_a_line_break_left_in_it_cannot_enter_the_base()
+    test.case("the base refuses it")
+    let m = req("https://e.com/", [f("Host", "e.com"), f("X-Bad", "one\r\ntwo")])
+    match hsigbase.signature_base(m, None, [hsigtypes.component("x-bad")], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_BAD_FIELD_VALUE)
+
+@test
+fn test_the_trailer_parameter_reads_the_trailers_and_only_them()
+    test.case("section 2.1.4: a trailer field is read with tr")
+    let resp = hsigmsg_with_trailer()
+    test.assert(value(resp, hsigtypes.component("@status")) == "200")
+    test.assert(value(resp, hsigtypes.component("trailer")) == "Expires")
+    test.assert(value(resp, hsigtypes.component_flag("expires", "tr")) == "Wed, 9 Nov 2022 07:28:00 GMT")
+    test.case("without tr the trailer is not found among the headers")
+    test.assert(value(resp, hsigtypes.component("expires")) == "!1")
+    test.case("a header and a trailer of one name are separate")
+    let both = hsigtypes.with_trailers(hsigtypes.response(200, [f("Expires", "header")]), [f("Expires", "trailer")])
+    test.assert(value(both, hsigtypes.component("expires")) == "header")
+    test.assert(value(both, hsigtypes.component_flag("expires", "tr")) == "trailer")
+
+fn hsigmsg_with_trailer() -> HsigMessage
+    hsigtypes.with_trailers(hsigtypes.response(200,
+        [f("Content-Type", "text/plain"), f("Transfer-Encoding", "chunked"), f("Trailer", "Expires")]),
+    [f("Expires", "Wed, 9 Nov 2022 07:28:00 GMT")])
+
+// ── 2.1.1 to 2.1.3: sf, key and bs ───────────────────────────────────
+
+fn typed(m: HsigMessage) -> HsigMessage
+    hsigtypes.with_field_types(m, [hsigtypes.field_type_of("Example-Dict", HSIG_SF_DICT),
+        hsigtypes.field_type_of("example-list", HSIG_SF_LIST),
+        hsigtypes.field_type_of("example-item", HSIG_SF_ITEM)])
+
+@test
+fn test_sf_reserialises_a_structured_field_strictly()
+    let m = typed(section_2_1_message())
+    test.case("section 2.1.1: a Dictionary")
+    test.assert(value(m, hsigtypes.component_flag("example-dict", "sf")) == "a=1, b=2;x=1;y=2, c=(a b c)")
+
+    test.case("a List and an Item")
+    let m2 = typed(req("https://e.com/", [f("Example-List", "a,   b;q=1"), f("Example-Item", "  5;  a=1")]))
+    test.assert(value(m2, hsigtypes.component_flag("example-list", "sf")) == "a, b;q=1")
+    test.assert(value(m2, hsigtypes.component_flag("example-item", "sf")) == "5;a=1")
+
+    test.case("two lines of a Dictionary are combined into one before serialising")
+    let m3 = typed(req("https://e.com/", [f("Example-Dict", "a=1"), f("Example-Dict", "b=2")]))
+    test.assert(value(m3, hsigtypes.component_flag("example-dict", "sf")) == "a=1, b=2")
+
+    test.case("a field whose type is not known is an error")
+    test.assert(value(m2, hsigtypes.component_flag("host", "sf")) == "!1")
+    let unknown = req("https://e.com/", [f("X-Mystery", "1")])
+    test.assert(value(unknown, hsigtypes.component_flag("x-mystery", "sf")) == "!" + str.from_int(HSIG_ERR_UNKNOWN_FIELD_TYPE))
+
+    test.case("a value that is not of its type is an error")
+    let bad = typed(req("https://e.com/",
+        [f("Example-Dict", "a=("), f("Example-Item", "1 2"), f("Example-List", "1,")]))
+    test.assert(value(bad, hsigtypes.component_flag("example-dict", "sf")) == "!" + str.from_int(HSIG_ERR_BAD_FIELD_VALUE))
+    test.assert(value(bad, hsigtypes.component_flag("example-item", "sf")) == "!" + str.from_int(HSIG_ERR_BAD_FIELD_VALUE))
+    test.assert(value(bad, hsigtypes.component_flag("example-list", "sf")) == "!" + str.from_int(HSIG_ERR_BAD_FIELD_VALUE))
+
+@test
+fn test_key_selects_one_member_of_a_dictionary()
+    let m = typed(req("https://e.com/", [f("Example-Dict", "  a=1, b=2;x=1;y=2, c=(a   b    c), d")]))
+    test.case("section 2.1.2")
+    test.assert(value(m, hsigtypes.component_key("example-dict", "a")) == "1")
+    test.assert(value(m, hsigtypes.component_key("example-dict", "d")) == "?1")
+    test.assert(value(m, hsigtypes.component_key("example-dict", "b")) == "2;x=1;y=2")
+    test.assert(value(m, hsigtypes.component_key("example-dict", "c")) == "(a b c)")
+
+    test.case("a member that is not there is an error")
+    test.assert(value(m, hsigtypes.component_key("example-dict", "z")) == "!" + str.from_int(HSIG_ERR_MISSING_MEMBER))
+
+    test.case("a field that is not a Dictionary, or not known to be one, is an error")
+    let plain = req("https://e.com/", [f("X-Mystery", "a=1")])
+    test.assert(value(plain, hsigtypes.component_key("x-mystery", "a")) == "!" + str.from_int(HSIG_ERR_UNKNOWN_FIELD_TYPE))
+    let list_typed = typed(req("https://e.com/", [f("Example-List", "a=1")]))
+    test.assert(value(list_typed, hsigtypes.component_key("example-list", "a")) == "!" + str.from_int(HSIG_ERR_UNKNOWN_FIELD_TYPE))
+
+    test.case("a Dictionary that does not parse is an error")
+    let bad = typed(req("https://e.com/", [f("Example-Dict", "a=(")]))
+    test.assert(value(bad, hsigtypes.component_key("example-dict", "a")) == "!" + str.from_int(HSIG_ERR_BAD_FIELD_VALUE))
+
+@test
+fn test_the_built_in_table_of_structured_fields_serves_sf_and_key()
+    test.case("Content-Digest and Signature are Dictionaries")
+    let m = req("https://e.com/",
+        [f("Content-Digest", "sha-256=:AAAA:,   sha-512=:BBBB:"), f("Client-Cert", ":MIIB:")])
+    test.assert(value(m, hsigtypes.component_flag("content-digest", "sf")) == "sha-256=:AAAA:, sha-512=:BBBB:")
+    test.assert(value(m, hsigtypes.component_key("content-digest", "sha-512")) == ":BBBB:")
+    test.assert(value(m, hsigtypes.component_flag("client-cert", "sf")) == ":MIIB:")
+    test.case("the table")
+    for name in ["Signature",
+    "signature-input",
+    "Accept-Signature",
+    "Content-Digest",
+    "Repr-Digest",
+    "Want-Content-Digest",
+    "Want-Repr-Digest",
+    "Priority",
+    "CDN-Cache-Control"]
+        test.assert(hsigtypes.known_field_type(name) == HSIG_SF_DICT)
+    for name in ["Cache-Status", "Proxy-Status", "Accept-CH", "Client-Cert-Chain"]
+        test.assert(hsigtypes.known_field_type(name) == HSIG_SF_LIST)
+    test.assert(hsigtypes.known_field_type("Client-Cert") == HSIG_SF_ITEM)
+    test.assert(hsigtypes.known_field_type("Host") == 0)
+    test.case("the caller's types come first")
+    let m2 = hsigtypes.with_field_types(m, [hsigtypes.field_type_of("content-digest", HSIG_SF_LIST)])
+    test.assert(hsigtypes.field_type(m2, "Content-Digest") == HSIG_SF_LIST)
+
+@test
+fn test_bs_wraps_each_line_as_a_byte_sequence()
+    test.case("section 2.1.3: two lines, then one line holding the same text")
+    let two = req("https://e.com/",
+        [f("Example-Header", "value, with, lots"), f("Example-Header", "of, commas")])
+    test.assert(value(two, hsigtypes.component_flag("example-header", "bs")) == ":dmFsdWUsIHdpdGgsIGxvdHM=:, :b2YsIGNvbW1hcw==:")
+    let one = req("https://e.com/", [f("Example-Header", "value, with, lots, of, commas")])
+    test.assert(value(one, hsigtypes.component_flag("example-header", "bs")) == ":dmFsdWUsIHdpdGgsIGxvdHMsIG9mLCBjb21tYXM=:")
+    test.case("without bs the two collide, which is why bs exists")
+    test.assert(value(two, hsigtypes.component("example-header")) == value(one, hsigtypes.component("example-header")))
+
+// ── 2.2 Derived components ───────────────────────────────────────────
+
+fn post_request() -> HsigMessage
+    match hsigmsg.request("POST",
+        "https://www.example.com/path?param=value&foo=bar&baz=bat%2Dman",
+        [f("Host", "www.example.com")])
+        Ok(m)  => m
+        Err(_) => hsigtypes.response(0, [])
+
+@test
+fn test_derived_components_of_section_2_2()
+    let m = post_request()
+    test.case("@method keeps its case")
+    test.assert(value(m, hsigtypes.component("@method")) == "POST")
+    test.case("@target-uri")
+    test.assert(value(m, hsigtypes.component("@target-uri")) == "https://www.example.com/path?param=value&foo=bar&baz=bat%2Dman")
+    test.case("@authority, @scheme, @path")
+    test.assert(value(m, hsigtypes.component("@authority")) == "www.example.com")
+    test.assert(value(m, hsigtypes.component("@scheme")) == "https")
+    test.assert(value(m, hsigtypes.component("@path")) == "/path")
+    test.case("@query keeps its percent-encoding and its question mark")
+    test.assert(value(m, hsigtypes.component("@query")) == "?param=value&foo=bar&baz=bat%2Dman")
+    test.case("@request-target in origin form")
+    test.assert(value(m, hsigtypes.component("@request-target")) == "/path?param=value&foo=bar&baz=bat%2Dman")
+
+@test
+fn test_the_query_is_a_question_mark_alone_when_absent_and_the_path_a_slash_when_empty()
+    test.case("no query")
+    let m = req("http://www.example.com/path", [])
+    test.assert(value(m, hsigtypes.component("@query")) == "?")
+    test.assert(value(m, hsigtypes.component("@request-target")) == "/path")
+    test.assert(value(m, hsigtypes.component("@scheme")) == "http")
+    test.case("a bare question mark in the URI")
+    test.assert(value(req("http://h/p?", []), hsigtypes.component("@query")) == "?")
+    test.assert(value(req("http://h/p?", []), hsigtypes.component("@target-uri")) == "http://h/p?")
+    test.case("a query that is a name alone, and an empty path")
+    test.assert(value(req("https://h?queryString", []), hsigtypes.component("@query")) == "?queryString")
+    test.assert(value(req("https://h?queryString", []), hsigtypes.component("@path")) == "/")
+    test.assert(value(req("https://h?queryString", []), hsigtypes.component("@target-uri")) == "https://h/?queryString")
+    test.assert(value(req("https://h", []), hsigtypes.component("@request-target")) == "/")
+
+@test
+fn test_the_other_forms_of_the_request_target()
+    test.case("absolute form, authority form and asterisk form are given by the caller")
+    let m = req("https://www.example.com/path?param=value", [])
+    test.assert(value(hsigtypes.with_request_target(m, "https://www.example.com/path?param=value"),
+        hsigtypes.component("@request-target")) == "https://www.example.com/path?param=value")
+    test.assert(value(hsigtypes.with_request_target(m, "www.example.com:80"), hsigtypes.component("@request-target")) == "www.example.com:80")
+    test.assert(value(hsigtypes.with_request_target(m, "*"), hsigtypes.component("@request-target")) == "*")
+
+@test
+fn test_the_authority_is_normalised()
+    test.case("lower case, default port removed, empty port removed")
+    test.assert(hsigmsg.authority_value(req("https://WWW.Example.COM/", [])) == "www.example.com")
+    test.assert(hsigmsg.authority_value(req("https://www.example.com:443/", [])) == "www.example.com")
+    test.assert(hsigmsg.authority_value(req("http://www.example.com:80/", [])) == "www.example.com")
+    test.assert(hsigmsg.authority_value(req("https://www.example.com:80/", [])) == "www.example.com:80")
+    test.assert(hsigmsg.authority_value(req("http://www.example.com:443/", [])) == "www.example.com:443")
+    test.assert(hsigmsg.authority_value(req("https://www.example.com:8443/", [])) == "www.example.com:8443")
+    test.assert(hsigmsg.authority_value(req("https://www.example.com:/", [])) == "www.example.com")
+    test.case("@target-uri keeps the authority as given")
+    test.assert(hsigmsg.target_uri_value(req("https://WWW.Example.COM/a", [])) == "https://WWW.Example.COM/a")
+
+@test
+fn test_a_target_uri_is_split_into_its_parts()
+    test.case("scheme lowered, fragment dropped")
+    match hsigmsg.request("GET", "HTTPS://Host.example:8443/a/b?x=1&y=2#frag", [])
+        Err(_) => test.fail("parsed")
+        Ok(m)  =>
+            test.assert(m.scheme == "https")
+            test.assert(m.authority == "Host.example:8443")
+            test.assert(m.path == "/a/b")
+            test.assert(m.query == Some("x=1&y=2"))
+    test.case("a fragment after the authority")
+    match hsigmsg.request("GET", "https://h#f", [])
+        Err(_) => test.fail("parsed")
+        Ok(m)  =>
+            test.assert(m.path == "")
+            test.assert(m.query == None)
+    test.case("not an absolute URI")
+    for bad in ["/path", "example.com/x", "://h/x", "https:///x", "https://?q"]
+        match hsigmsg.request("GET", bad, [])
+            Ok(_)  => test.fail("accepted " + bad)
+            Err(e) => test.assert(e.code == HSIG_ERR_BAD_TARGET)
+
+@test
+fn test_status_is_a_response_component()
+    let r = hsigtypes.response(200, [])
+    test.assert(value(r, hsigtypes.component("@status")) == "200")
+    test.case("not on a request")
+    test.assert(value(post_request(), hsigtypes.component("@status")) == "!" + str.from_int(HSIG_ERR_WRONG_MESSAGE))
+    test.case("and a request component is not on a response")
+    for name in ["@method", "@target-uri", "@authority", "@scheme", "@request-target", "@path", "@query"]
+        test.assert(value(r, hsigtypes.component(name)) == "!" + str.from_int(HSIG_ERR_WRONG_MESSAGE))
+    test.assert(value(r, hsigtypes.component_query_param("a")) == "!" + str.from_int(HSIG_ERR_WRONG_MESSAGE))
+
+// ── 2.2.8 Query parameters ───────────────────────────────────────────
+
+@test
+fn test_named_query_parameters_of_section_2_2_8()
+    let m = req("https://www.example.com/path?param=value&foo=bar&baz=batman&qux=", [])
+    test.assert(value(m, hsigtypes.component_query_param("baz")) == "batman")
+    test.assert(value(m, hsigtypes.component_query_param("qux")) == "")
+    test.assert(value(m, hsigtypes.component_query_param("param")) == "value")
+
+    test.case("a parameter that is not there is an error")
+    test.assert(value(m, hsigtypes.component_query_param("nope")) == "!" + str.from_int(HSIG_ERR_MISSING_MEMBER))
+    test.assert(value(req("https://h/p", []), hsigtypes.component_query_param("a")) == "!" + str.from_int(HSIG_ERR_MISSING_MEMBER))
+
+    test.case("a name that occurs twice is ambiguous")
+    test.assert(value(req("https://h/p?a=1&a=2", []), hsigtypes.component_query_param("a")) == "!" + str.from_int(HSIG_ERR_AMBIGUOUS))
+
+@test
+fn test_query_parameters_are_decoded_and_encoded_again()
+    let m = req("https://www.example.com/parameters?var=this%20is%20a%20big%0Amultiline%20value&bar=with+plus+whitespace&fa%C3%A7ade%22%3A%20=something",
+        [])
+    test.case("section 2.2.8: percent-encoded text and plus signs")
+    test.assert(value(m, hsigtypes.component_query_param("var")) == "this%20is%20a%20big%0Amultiline%20value")
+    test.assert(value(m, hsigtypes.component_query_param("bar")) == "with%20plus%20whitespace")
+    test.assert(value(m, hsigtypes.component_query_param("fa%C3%A7ade%22%3A%20")) == "something")
+
+    test.case("lower-case hexadecimal is read and written in upper case")
+    test.assert(value(req("https://h/p?a=%c3%a9", []), hsigtypes.component_query_param("a")) == "%C3%A9")
+    test.case("a percent sign that starts no escape is kept as a byte and written as %25")
+    test.assert(value(req("https://h/p?a=100%&b=%zz", []), hsigtypes.component_query_param("a")) == "100%25")
+    test.assert(value(req("https://h/p?a=100%&b=%zz", []), hsigtypes.component_query_param("b")) == "%25zz")
+    test.case("the unreserved bytes stay")
+    test.assert(hsigmsg.form_encode("aZ09-._~") == "aZ09-._~")
+    test.assert(hsigmsg.form_encode("a b*") == "a%20b%2A")
+    test.case("empty pieces are skipped and a piece with no equals sign has an empty value")
+    test.assert(value(req("https://h/p?&&a&b=1", []), hsigtypes.component_query_param("a")) == "")
+
+// ── Refusals ─────────────────────────────────────────────────────────
+
+fn code_of(m: HsigMessage, c: HsigComponent) -> Int
+    match hsigbase.component_value(m, None, c)
+        Ok(_)  => 0
+        Err(e) => e.code
+
+@test
+fn test_each_condition_of_section_2_5_that_fails_the_algorithm()
+    let m = typed(req("https://e.com/p?a=1", [f("Host", "e.com"), f("Example-Dict", "a=1")]))
+
+    test.case("a field that is not in the message")
+    test.assert(code_of(m, hsigtypes.component("x-absent")) == HSIG_ERR_MISSING_FIELD)
+
+    test.case("a derived component that is not known")
+    test.assert(code_of(m, hsigtypes.component("@nope")) == HSIG_ERR_UNKNOWN_COMPONENT)
+    test.assert(code_of(m, hsigtypes.component("@signature-params")) == HSIG_ERR_UNKNOWN_COMPONENT)
+
+    test.case("a parameter that is unknown")
+    test.assert(code_of(m, hsigtypes.component_with("host", [sfvtypes.param("zz", SfvBoolean(true))])) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_with("@method", [sfvtypes.param("zz", SfvBoolean(true))])) == HSIG_ERR_BAD_PARAMETER)
+
+    test.case("a flag that is not true, and key or name that is not a String")
+    test.assert(code_of(m, hsigtypes.component_with("host", [sfvtypes.param("sf", SfvBoolean(false))])) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_with("host", [sfvtypes.param("sf", SfvInteger(1))])) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_with("example-dict", [sfvtypes.param("key", SfvInteger(1))])) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_with("@query-param", [sfvtypes.param("name", SfvInteger(1))])) == HSIG_ERR_BAD_PARAMETER)
+
+    test.case("a parameter that does not apply: sf or key on a derived component, name elsewhere")
+    test.assert(code_of(m, hsigtypes.component_flag("@method", "sf")) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_flag("@method", "tr")) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_with("@path", [sfvtypes.param("name", SfvString("a"))])) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component_with("host", [sfvtypes.param("name", SfvString("a"))])) == HSIG_ERR_BAD_PARAMETER)
+    test.assert(code_of(m, hsigtypes.component("@query-param")) == HSIG_ERR_BAD_PARAMETER)
+
+    test.case("bs with sf or with key")
+    test.assert(code_of(m, hsigtypes.component_with("example-dict",
+        [sfvtypes.param("bs", SfvBoolean(true)), sfvtypes.param("sf", SfvBoolean(true))])) == HSIG_ERR_INCOMPATIBLE)
+    test.assert(code_of(m, hsigtypes.component_with("example-dict",
+        [sfvtypes.param("bs", SfvBoolean(true)), sfvtypes.param("key", SfvString("a"))])) == HSIG_ERR_INCOMPATIBLE)
+
+    test.case("req on a request, and req on a response with no request")
+    test.assert(code_of(m, hsigtypes.component_flag("host", "req")) == HSIG_ERR_REQ_ON_REQUEST)
+    test.assert(code_of(hsigtypes.response(200, []), hsigtypes.component_flag("host", "req")) == HSIG_ERR_NO_REQUEST)
+
+    test.case("req with a request that is itself a response, and @status with req")
+    match hsigbase.component_value(hsigtypes.response(200, []),
+        Some(hsigtypes.response(200, [])),
+        hsigtypes.component_flag("@method", "req"))
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_WRONG_MESSAGE)
+    match hsigbase.component_value(hsigtypes.response(200, []), Some(m), hsigtypes.component_flag("@status", "req"))
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_WRONG_MESSAGE)
+
+@test
+fn test_the_signature_base_refuses_what_cannot_be_a_base()
+    let m = req("https://e.com/p", [f("Host", "e.com"), f("Date", "d")])
+
+    test.case("a component covered twice, with the same parameters")
+    match hsigbase.signature_base(m, None, [hsigtypes.component("date"), hsigtypes.component("date")], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_DUPLICATE_COMPONENT)
+
+    test.case("the same name with different parameters is two components")
+    match hsigbase.signature_base(m, None, [hsigtypes.component("@method"), hsigtypes.component_with("host", [])], [])
+        Ok(b)  => test.assert(str.contains(b, "\"host\": e.com"))
+        Err(_) => test.fail("refused")
+
+    test.case("@signature-params is not a component")
+    match hsigbase.signature_base(m, None, [hsigtypes.component("@signature-params")], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_SIGNATURE_PARAMS_COMPONENT)
+
+    test.case("a value outside ASCII")
+    let na = req("https://e.com/p", [f("X-Name", "café")])
+    match hsigbase.signature_base(na, None, [hsigtypes.component("x-name")], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_NOT_ASCII)
+
+    test.case("a component the Structured Field writer refuses")
+    match hsigbase.signature_base(m, None, [hsigtypes.component_with("date", [sfvtypes.param("K", SfvBoolean(true))])], [])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_UNSERIALISABLE)
+    match hsigbase.signature_base(m, None, [hsigtypes.component("date")], [sfvtypes.param("K", SfvInteger(1))])
+        Ok(_)  => test.fail("accepted")
+        Err(e) => test.assert(e.code == HSIG_ERR_UNSERIALISABLE)
+
+    test.case("a name that is not in lower case, or is empty")
+    for bad in ["Date", "@Method", ""]
+        match hsigbase.signature_base(m, None, [hsigtypes.component(bad)], [])
+            Ok(_)  => test.fail("accepted " + bad)
+            Err(e) => test.assert(e.code == HSIG_ERR_BAD_NAME)
+
+@test
+fn test_the_identifier_and_the_parameters_line_are_structured_field_text()
+    test.case("the identifier of a component")
+    test.assert(hsigbase.identifier(hsigtypes.component("date")) == Ok("\"date\""))
+    test.assert(hsigbase.identifier(hsigtypes.component_key("example-dict", "a")) == Ok("\"example-dict\";key=\"a\""))
+    test.assert(hsigbase.identifier(hsigtypes.component_query_param("Pet")) == Ok("\"@query-param\";name=\"Pet\""))
+    test.assert(hsigbase.identifier(hsigtypes.component_flag("date", "tr")) == Ok("\"date\";tr"))
+
+    test.case("section 2.3: the example parameters")
+    let comps = [hsigtypes.component("@target-uri"),
+        hsigtypes.component("@authority"),
+        hsigtypes.component("date"),
+        hsigtypes.component("cache-control")]
+    let params = [sfvtypes.param("keyid", SfvString("test-key-rsa-pss")),
+        sfvtypes.param("alg", SfvString("rsa-pss-sha512")),
+        sfvtypes.param("created", SfvInteger(1618884475)),
+        sfvtypes.param("expires", SfvInteger(1618884775))]
+    test.assert(hsigbase.signature_params_value(comps, params) == Ok("(\"@target-uri\" \"@authority\" \"date\" \"cache-control\");keyid=\"test-key-rsa-pss\";alg=\"rsa-pss-sha512\";created=1618884475;expires=1618884775"))
+    test.case("the order of the parameters is the order given")
+    test.assert(hsigbase.signature_params_value([], [sfvtypes.param("keyid", SfvString("k")), sfvtypes.param("created", SfvInteger(1))]) == Ok("();keyid=\"k\";created=1"))
+    test.assert(hsigbase.signature_params_value([], [sfvtypes.param("created", SfvInteger(1)), sfvtypes.param("keyid", SfvString("k"))]) == Ok("();created=1;keyid=\"k\""))
+    test.case("a covered component with parameters keeps them inside the list")
+    test.assert(hsigbase.signature_params_value([hsigtypes.component_key("example-dict", "a")], []) == Ok("(\"example-dict\";key=\"a\")"))
+
+@test
+fn test_section_2_5_the_example_base()
+    let m = match hsigmsg.request("POST", "https://example.com/foo?param=Value&Pet=dog", [f("Host", "example.com"), f("Date", "Tue, 20 Apr 2021 02:07:55 GMT"), f("Content-Type", "application/json"), f("Content-Digest",
+        "sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:"),
+    f("Content-Length", "18")])
+        Ok(x)  => x
+        Err(_) => hsigtypes.response(0, [])
+    let comps = [hsigtypes.component("@method"),
+        hsigtypes.component("@authority"),
+        hsigtypes.component("@path"),
+        hsigtypes.component("content-digest"),
+        hsigtypes.component("content-length"),
+        hsigtypes.component("content-type")]
+    let params = [sfvtypes.param("created", SfvInteger(1618884473)),
+        sfvtypes.param("keyid", SfvString("test-key-rsa-pss"))]
+    let want = str.join(["\"@method\": POST",
+        "\"@authority\": example.com",
+        "\"@path\": /foo",
+        "\"content-digest\": sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        "\"content-length\": 18",
+        "\"content-type\": application/json",
+        "\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\" \"content-length\" \"content-type\");created=1618884473;keyid=\"test-key-rsa-pss\""],
+    "\n")
+    test.assert(hsigbase.signature_base(m, None, comps, params) == Ok(want))
+
+// ── The helpers a caller can use on their own ────────────────────────
+
+fn message_with_trailer() -> HsigMessage
+    hsigtypes.with_trailers(req("https://h/p?q=1", [f("X-A", "h1"), f("x-a", "h2")]), [f("X-A", "t1")])
+
+fn written(it: SfvItem) -> Str
+    match sfvwrite.serialize_item(it)
+        Ok(t)  => t
+        Err(_) => "!"
+
+@test
+fn test_the_message_helpers_answer_what_the_components_use()
+    let m = message_with_trailer()
+    test.case("message_lines reads headers or trailers")
+    test.assert(hsigmsg.message_lines(m, false, "X-A") == ["h1", "h2"])
+    test.assert(hsigmsg.message_lines(m, true, "x-a") == ["t1"])
+    test.assert(list.len(hsigmsg.message_lines(m, true, "absent")) == 0)
+
+    test.case("path, query and request target")
+    test.assert(hsigmsg.path_value(m) == "/p")
+    test.assert(hsigmsg.query_value(m) == "?q=1")
+    test.assert(hsigmsg.request_target_value(m) == "/p?q=1")
+    test.assert(hsigmsg.path_value(req("https://h", [])) == "/")
+    test.assert(hsigmsg.query_value(req("https://h/p", [])) == "?")
+    test.assert(hsigmsg.request_target_value(req("https://h/p", [])) == "/p")
+
+    test.case("query_param_value and component_item")
+    test.assert(hsigmsg.query_param_value(Some("a=1&b=2"), "b") == Ok("2"))
+    test.assert(hsigmsg.query_param_value(None, "b") == Err(hsigtypes.error(HSIG_ERR_MISSING_MEMBER, "b")))
+    test.assert(written(hsigtypes.component_item(hsigtypes.component_key("d", "k"))) == "\"d\";key=\"k\"")
